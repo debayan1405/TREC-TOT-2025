@@ -12,6 +12,7 @@ def main(env_path: str, models_to_run=None):
     validate_env(env)
 
     paths = env["paths"]
+    hf_token = env.get("hf_token", None)
     generation_conf = env.get("generation", {})
     preview_count = env.get("logging", {}).get("preview_count", 5)
 
@@ -32,13 +33,10 @@ def main(env_path: str, models_to_run=None):
         hf_id = model_cfg["hf_id"]
         bnb_conf = model_cfg.get("bitsandbytes", {})
 
-        # Example: run for each dataset version (you can customize)
         for ver, topic_path in version_map.items():
             print(f"\n--- Dataset version: {ver} ---")
             output_dir = paths["rewritten_queries_directory"]
-            # Create output dir if missing
             os.makedirs(output_dir, exist_ok=True)
-            # call rewrite function
             rewrite_topic_set(
                 model_name=model_name,
                 model_hf_id=hf_id,
@@ -46,7 +44,8 @@ def main(env_path: str, models_to_run=None):
                 topic_file=topic_path,
                 output_dir=output_dir,
                 generation_conf=generation_conf,
-                preview_count=preview_count
+                preview_count=preview_count,
+                hf_token=hf_token
             )
 
 

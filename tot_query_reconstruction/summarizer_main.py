@@ -1,14 +1,18 @@
+# summarizer_main.py
 import json
 from pathlib import Path
 from loguru import logger
 from summarizer import summarize_queries
+from rewriter import validate_env
 
 
 def main():
     with open("env.json", "r", encoding="utf-8") as f:
         env = json.load(f)
+    validate_env(env)
 
-    # Paths to rewritten queries (3 models)
+    hf_token = env.get("hf_token", None)
+
     rewritten_dir = Path(env["rewritten_queries_directory"])
     input_files = [
         rewritten_dir / "llama_reconstruction.jsonl",
@@ -19,7 +23,8 @@ def main():
     summarizer_cfg = env["summarizer"]
     output_file = rewritten_dir / summarizer_cfg["output_filename"]
 
-    summarize_queries(env, summarizer_cfg, input_files, output_file)
+    summarize_queries(env, summarizer_cfg, input_files,
+                      output_file, hf_token=hf_token)
 
 
 if __name__ == "__main__":
