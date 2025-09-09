@@ -1,6 +1,7 @@
 """
 Configuration loader module for PyTerrier experiments.
 Handles loading and validation of configuration from env.json file.
+Fixed for new env.json structure with dynamic path support.
 """
 
 import json
@@ -19,9 +20,31 @@ class ConfigLoader:
         Args:
             config_path (str): Path to the configuration JSON file
         """
-        self.config_path = config_path
+        self.config_path = self._find_config_path(config_path)
         self.config = self._load_config()
         self._validate_config()
+
+    def _find_config_path(self, config_path: str) -> str:
+        """Find config file, checking current dir and parent dirs if needed."""
+        if os.path.isabs(config_path):
+            return config_path
+
+        # Check current directory first
+        if os.path.exists(config_path):
+            return config_path
+
+        # Check parent directory
+        parent_path = Path(__file__).parent.parent / config_path
+        if parent_path.exists():
+            return str(parent_path)
+
+        # Check two levels up
+        grandparent_path = Path(__file__).parent.parent.parent / config_path
+        if grandparent_path.exists():
+            return str(grandparent_path)
+
+        # If not found, return original path (will cause FileNotFoundError later)
+        return config_path
 
     def _load_config(self) -> Dict[str, Any]:
         """Load configuration from JSON file."""
@@ -35,16 +58,42 @@ class ConfigLoader:
             raise ValueError(f"Invalid JSON in configuration file: {e}")
 
     def _validate_config(self) -> None:
-        """Validate required configuration keys."""
-        required_keys = [
-            "index_path", "topics_path", "qrels_path",
-            "run_directory", "k_sparse", "eval_metrics"
+        """Validate required configuration keys for new structure."""
+        # Check top-level structure
+        if "paths" not in self.config:
+            raise ValueError("Configuration must contain 'paths' section")
+
+        paths = self.config["paths"]
+
+        # Required path keys
+        required_path_keys = [
+            "index_path", "run_directory"
         ]
 
-        missing_keys = [key for key in required_keys if key not in self.config]
-        if missing_keys:
+        # Required topic paths
+        topic_path_keys = [
+            "train_topics_path", "dev_1_topics_path", "dev_2_topics_path",
+            "dev_3_topics_path", "test_topics_path"
+        ]
+
+        # Required qrel paths
+        qrel_path_keys = [
+            "train_qrels_path", "dev1_qrels_path", "dev2_qrels_path", "dev3_qrels_path"
+        ]
+
+        all_required_paths = required_path_keys + topic_path_keys + qrel_path_keys
+
+        missing_paths = [key for key in all_required_paths if key not in paths]
+        if missing_paths:
+            raise ValueError(f"Missing required path keys: {missing_paths}")
+
+        # Validate other required top-level keys
+        other_required = ["k_sparse", "eval_metrics"]
+        missing_other = [
+            key for key in other_required if key not in self.config]
+        if missing_other:
             raise ValueError(
-                f"Missing required configuration keys: {missing_keys}")
+                f"Missing required configuration keys: {missing_other}")
 
         # Validate k_sparse is positive integer
         if not isinstance(self.config["k_sparse"], int) or self.config["k_sparse"] <= 0:
@@ -56,7 +105,7 @@ class ConfigLoader:
 
     def get_index_path(self) -> str:
         """Get index path."""
-        return self.config["index_path"]
+        return self.config["paths"]["index_path"]
 
     def get_topics_path(self, version: str = "train") -> str:
         """
@@ -84,23 +133,23 @@ class ConfigLoader:
 
     def get_train_topics_path(self) -> str:
         """Get train topics file path."""
-        return self.config["train_topics_path"]
+        return self.config["paths"]["train_topics_path"]
 
     def get_dev_1_topics_path(self) -> str:
         """Get dev-1 topics file path."""
-        return self.config["dev_1_topics_path"]
+        return self.config["paths"]["dev_1_topics_path"]
 
     def get_dev_2_topics_path(self) -> str:
         """Get dev-2 topics file path."""
-        return self.config["dev_2_topics_path"]
+        return self.config["paths"]["dev_2_topics_path"]
 
     def get_dev_3_topics_path(self) -> str:
         """Get dev-3 topics file path."""
-        return self.config["dev_3_topics_path"]
+        return self.config["paths"]["dev_3_topics_path"]
 
     def get_test_topics_path(self) -> str:
         """Get test topics file path."""
-        return self.config["test_topics_path"]
+        return self.config["paths"]["test_topics_path"]
 
     def get_qrels_path(self, version: str = "train") -> str:
         """
@@ -126,24 +175,24 @@ class ConfigLoader:
         return version_map[version]()
 
     def get_train_qrels_path(self) -> str:
-        """Get qrels file path."""
-        return self.config["train_qrels_path"]
+        """Get train qrels file path."""
+        return self.config["paths"]["train_qrels_path"]
 
     def get_dev_1_qrels_path(self) -> str:
         """Get dev-1 qrels file path."""
-        return self.config["dev_1_qrels_path"]
+        return self.config["paths"]["dev1_qrels_path"]
 
     def get_dev_2_qrels_path(self) -> str:
         """Get dev-2 qrels file path."""
-        return self.config["dev_2_qrels_path"]
+        return self.config["paths"]["dev2_qrels_path"]
 
     def get_dev_3_qrels_path(self) -> str:
         """Get dev-3 qrels file path."""
-        return self.config["dev_3_qrels_path"]
+        return self.config["paths"]["dev3_qrels_path"]
 
     def get_run_directory(self) -> str:
         """Get run directory path."""
-        return self.config["run_directory"]
+        return self.config["paths"]["run_directory"]
 
     def get_k_sparse(self) -> int:
         """Get k_sparse value."""
@@ -157,3 +206,7 @@ class ConfigLoader:
         """Create run directory if it doesn't exist."""
         run_dir = Path(self.get_run_directory())
         run_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_rewritten_queries_directory(self) -> str:
+        """Get rewritten queries directory path."""
+        return self.config["paths"]["rewritten_queries_directory"]
