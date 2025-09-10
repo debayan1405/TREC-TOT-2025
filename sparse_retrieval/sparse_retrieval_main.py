@@ -6,6 +6,13 @@ import os
 import sys
 from pathlib import Path
 
+# Maximize CPU utilization for high-end hardware
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())  # Use all CPU cores
+os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())  # Intel MKL threading
+os.environ["NUMEXPR_NUM_THREADS"] = str(os.cpu_count())  # NumExpr threading
+os.environ["OPENBLAS_NUM_THREADS"] = str(os.cpu_count())  # OpenBLAS threading
+print(f"🚀 Optimized CPU utilization: Using all {os.cpu_count()} CPU cores")
+
 # Fix Java environment before importing PyTerrier
 def setup_java_environment():
     """Set up Java environment for PyTerrier."""
@@ -30,12 +37,23 @@ def setup_java_environment():
         print("ERROR: Could not find a working Java installation")
         sys.exit(1)
     
-    # Set environment variables
+    # Set environment variables with performance optimizations
     os.environ['JAVA_HOME'] = java_home
     os.environ['LD_LIBRARY_PATH'] = f"{java_home}/lib/server:{os.environ.get('LD_LIBRARY_PATH', '')}"
     os.environ['JVM_PATH'] = f"{java_home}/lib/server/libjvm.so"
     
+    # Additional Java performance optimizations
+    os.environ['JAVA_OPTS'] = (
+        f"-Xms16g -Xmx32g "  # Start with 16GB, max 32GB heap
+        f"-XX:+UseG1GC "
+        f"-XX:MaxGCPauseMillis=200 "
+        f"-XX:ParallelGCThreads={min(16, os.cpu_count())} "
+        f"-XX:+UseStringDeduplication "
+        f"-server"
+    )
+    
     print(f"✓ Set JAVA_HOME to: {java_home}")
+    print(f"✓ Optimized Java performance settings for {os.cpu_count()} CPU cores")
     return java_home
 
 # Setup Java environment before importing PyTerrier
@@ -56,10 +74,10 @@ from sparse_retrieval import SparseRetrieval
 
 # Dataset to run experiments on (CHANGE THIS AS NEEDED)
 # Options: "train", "dev-1", "dev-2", "dev-3", "test"
-DATASET_VERSION = "train"  # <-- CHANGE THIS LINE TO USE DIFFERENT DATASETS
+DATASET_VERSION = "test"  # <-- CHANGE THIS LINE TO USE DIFFERENT DATASETS
 
 # Query sources to test (None means auto-detect all available sources)
-QUERY_SOURCES = ["rewritten_llama"]
+QUERY_SOURCES = ["rewritten_llama"]  # Single source for manual runs
 # QUERY_SOURCES = ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
 
 # Models to run (None means all supported models)
@@ -112,11 +130,14 @@ def main(env_path: str = None, override_dataset: str = None,
         override_force_rerun: Override hard-coded force rerun setting
     """
     try:
-        # Initialize PyTerrier with optimized settings
+        # Initialize PyTerrier with optimized settings for high-end hardware
         if not hasattr(pt, 'java') or not pt.java.started():
-            print("🔧 Initializing PyTerrier with optimized settings...")
-            pt.init(mem=8192, logging="WARN")  # 8GB memory allocation
-            print("✓ PyTerrier initialized successfully")
+            print("🔧 Initializing PyTerrier with maximum performance settings...")
+            # Use modern PyTerrier API for memory allocation
+            pt.java.set_memory_limit(32768)  # 32GB memory allocation
+            pt.java.init()
+            pt.set_property("logging.warn", "true")  # Set warning level logging
+            print("✓ PyTerrier initialized with maximum performance settings")
         else:
             print("✓ PyTerrier already initialized")
 
