@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 import re
 
-from config_loader import ConfigLoader
+try:
+    from .config_loader import ConfigLoader
+except ImportError:
+    from config_loader import ConfigLoader
 
 
 def clean_query_text(query: str) -> str:
