@@ -44,7 +44,7 @@ class SparseRetrieval:
         Returns:
             str: Path to output directory
         """
-        base_run_dir = Path(self.config.get_run_directory())
+        base_run_dir = Path(self.config.get_sparse_run_directory())
 
         # Create hierarchical structure: run_directory/dataset_version/query_source/
         output_dir = base_run_dir / dataset_version / query_source
