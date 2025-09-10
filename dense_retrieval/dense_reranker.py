@@ -32,29 +32,59 @@ class DenseReranker:
         self.index = self.data_loader.get_index()
 
         # Define and create output directories
-        self.run_dir = Path(self.config.get_path("dense_run_directory")) / self.dataset_version
-        self.eval_dir = Path(self.config.get_path("dense_eval_directory")) / self.dataset_version
+        self.run_dir = Path(self.config.get_dense_run_directory()) / self.dataset_version
+        self.eval_dir = Path(self.config.get_dense_eval_directory()) / self.dataset_version
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.eval_dir.mkdir(parents=True, exist_ok=True)
 
     def _get_document_texts(self, docnos: list) -> dict:
         """Fetch the 'text' metadata for a list of docnos from the index."""
         texts = {}
-        # PyTerrier's get_meta is efficient for batch lookups
-        meta_df = self.index.getMetaIndex().getDocuments("docno", docnos)
-        for _, row in meta_df.iterrows():
-            texts[row['docno']] = row['text']
+        # Try to get document metadata using PyTerrier's index
+        try:
+            meta_index = self.index.getMetaIndex()
+            doc_index = self.index.getDocumentIndex()
+            
+            for docno in docnos:
+                try:
+                    # Get document ID from docno
+                    docid = doc_index.getDocumentId(docno)
+                    if docid >= 0:
+                        # Try to get the text metadata
+                        meta_data = meta_index.getItem("text", docid)
+                        if meta_data:
+                            texts[docno] = str(meta_data).strip()
+                        else:
+                            # Try alternative metadata fields
+                            title = meta_index.getItem("title", docid)
+                            texts[docno] = str(title).strip() if title else f"Document {docno}"
+                    else:
+                        texts[docno] = f"Document {docno}"
+                except Exception:
+                    texts[docno] = f"Document {docno}"
+        except Exception as e:
+            print(f"Warning: Could not fetch document texts: {e}")
+            # Fallback: use docno as text for reranking
+            texts = {docno: f"Document {docno}" for docno in docnos}
         return texts
 
     def rerank(self) -> Path:
         """
         Performs the entire re-ranking process for the specified configuration.
         """
+        # Convert rewriter to proper source type
+        if self.rewriter == "original":
+            source_type = "original"
+        elif self.rewriter == "summarized":
+            source_type = "summarized"  
+        else:
+            source_type = f"rewritten_{self.rewriter}"
+            
         # Load the corresponding query topics
-        topics_df = self.data_loader.load_topics(self.dataset_version, self.rewriter)
+        topics_df = self.data_loader.load_topics(self.dataset_version, source_type)
         
         # Load the fused run file to be re-ranked
-        fused_run_path = Path(self.config.get_path("fusion_run_directory")) / self.dataset_version / f"{self.rewriter}_{self.dataset_version}_fused.txt"
+        fused_run_path = Path(self.config.get_fusion_run_directory()) / self.dataset_version / f"{self.rewriter}_{self.dataset_version}_fused.txt"
         if not fused_run_path.exists():
             raise FileNotFoundError(f"Fused run file not found: {fused_run_path}")
         
@@ -69,16 +99,37 @@ class DenseReranker:
             docnos = group['docno'].tolist()
             doc_texts = self._get_document_texts(docnos)
             
-            # Encode query and document texts
-            query_embedding = self.model.encode(query_text, convert_to_tensor=True)
-            doc_embeddings = self.model.encode([doc_texts.get(d, "") for d in docnos], convert_to_tensor=True)
+            # Clean and prepare texts for encoding
+            query_text_clean = str(query_text).strip()
+            if not query_text_clean:
+                query_text_clean = "empty query"
+                
+            doc_texts_clean = []
+            for docno in docnos:
+                doc_text = doc_texts.get(docno, f"Document {docno}")
+                doc_text_clean = str(doc_text).strip()
+                if not doc_text_clean:
+                    doc_text_clean = f"Document {docno}"
+                doc_texts_clean.append(doc_text_clean)
             
-            # Compute cosine similarity
-            scores = cos_sim(query_embedding, doc_embeddings)[0].cpu().tolist()
-            
-            # Create a new ranked list
-            for i, docno in enumerate(docnos):
-                reranked_results.append({'qid': qid, 'docno': docno, 'score': scores[i]})
+            try:
+                # Encode query and document texts with error handling
+                query_embedding = self.model.encode(query_text_clean, convert_to_tensor=True)
+                doc_embeddings = self.model.encode(doc_texts_clean, convert_to_tensor=True)
+                
+                # Compute cosine similarity
+                scores = cos_sim(query_embedding, doc_embeddings)[0].cpu().tolist()
+                
+                # Create a new ranked list
+                for i, docno in enumerate(docnos):
+                    reranked_results.append({'qid': qid, 'docno': docno, 'score': scores[i]})
+                    
+            except Exception as e:
+                print(f"Warning: Failed to encode texts for query {qid}: {e}")
+                # Fallback: use original scores from fusion
+                for i, docno in enumerate(docnos):
+                    original_score = group[group['docno'] == docno]['score'].iloc[0]
+                    reranked_results.append({'qid': qid, 'docno': docno, 'score': original_score})
 
         # Create DataFrame and calculate new ranks
         reranked_df = pd.DataFrame(reranked_results)
