@@ -3,6 +3,7 @@ Main execution script for PyTerrier sparse retrieval experiments.
 Updated with hard-coded dataset control and enhanced path management.
 """
 import pyterrier as pt
+import pandas as pd
 from pathlib import Path
 import argparse
 import sys
@@ -20,9 +21,7 @@ from sparse_retrieval import SparseRetrieval
 DATASET_VERSION = "train"  # <-- CHANGE THIS LINE TO USE DIFFERENT DATASETS
 
 # Query sources to test (None means auto-detect all available sources)
-# Options: ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
-# Set to None to auto-detect, or specify a list like ["original", "rewritten_llama"]
-QUERY_SOURCES = None  # <-- CHANGE THIS TO SPECIFY SPECIFIC QUERY SOURCES
+QUERY_SOURCES = ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
 
 # Models to run (None means all supported models)
 # Options: ["BM25", "PL2", "TF_IDF"]

@@ -321,7 +321,7 @@ class SparseRetrieval:
 
         # Run retrieval
         try:
-            results = retriever.transform(topics, verbose = True)
+            results = retriever.transform(topics)
 
             # Ensure required columns are present
             required_cols = ["qid", "docno", "score", "rank"]
@@ -438,7 +438,7 @@ class SparseRetrieval:
                 qrels,
                 eval_metrics=eval_metrics,
                 names=retriever_names,
-                verbose = True
+                verbose=True
             )
 
             # Save individual evaluation results for each model
