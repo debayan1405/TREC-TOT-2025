@@ -1,6 +1,6 @@
 """
 Main execution script for PyTerrier sparse retrieval experiments.
-Updated to support multiple query sources and dynamic path management.
+Updated with hard-coded dataset control and enhanced path management.
 """
 import pyterrier as pt
 from pathlib import Path
@@ -9,6 +9,32 @@ import sys
 from config_loader import ConfigLoader
 from data_loader import DataLoader
 from sparse_retrieval import SparseRetrieval
+
+
+# =============================================================================
+# CONFIGURATION SECTION - MODIFY THESE VARIABLES AS NEEDED
+# =============================================================================
+
+# Dataset to run experiments on (CHANGE THIS AS NEEDED)
+# Options: "train", "dev-1", "dev-2", "dev-3", "test"
+DATASET_VERSION = "train"  # <-- CHANGE THIS LINE TO USE DIFFERENT DATASETS
+
+# Query sources to test (None means auto-detect all available sources)
+# Options: ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
+# Set to None to auto-detect, or specify a list like ["original", "rewritten_llama"]
+QUERY_SOURCES = None  # <-- CHANGE THIS TO SPECIFY SPECIFIC QUERY SOURCES
+
+# Models to run (None means all supported models)
+# Options: ["BM25", "PL2", "TF_IDF"]
+# Set to None for all models, or specify a list like ["BM25", "PL2"]
+MODELS_TO_RUN = None  # <-- CHANGE THIS TO SPECIFY SPECIFIC MODELS
+
+# Force rerun even if cached results exist
+FORCE_RERUN = False  # <-- CHANGE THIS TO True TO FORCE RERUN
+
+# =============================================================================
+# END CONFIGURATION SECTION
+# =============================================================================
 
 
 def find_env_path():
@@ -34,18 +60,18 @@ def find_env_path():
         "env.json not found in current directory, parent directory, or grandparent directory")
 
 
-def main(env_path: str = None, datasets_to_run: list = None,
-         query_sources: list = None, models_to_run: list = None,
-         force_rerun: bool = False):
+def main(env_path: str = None, override_dataset: str = None,
+         override_query_sources: list = None, override_models: list = None,
+         override_force_rerun: bool = None):
     """
-    Main execution function with comprehensive experiment support.
+    Main execution function with hard-coded configuration support.
 
     Args:
         env_path: Path to env.json (auto-detected if None)
-        datasets_to_run: Dataset versions to process (all if None)
-        query_sources: Query sources to test (auto-detected if None)
-        models_to_run: Retrieval models to run (all if None)
-        force_rerun: Force re-running experiments
+        override_dataset: Override hard-coded dataset version
+        override_query_sources: Override hard-coded query sources
+        override_models: Override hard-coded models
+        override_force_rerun: Override hard-coded force rerun setting
     """
     try:
         # Initialize PyTerrier
@@ -64,7 +90,8 @@ def main(env_path: str = None, datasets_to_run: list = None,
         config = ConfigLoader(env_path)
         print(f"Configuration loaded successfully")
         print(f"Index path: {config.get_index_path()}")
-        print(f"Run directory: {config.get_run_directory()}")
+        print(f"Sparse run directory: {config.get_sparse_run_directory()}")
+        print(f"Evaluation directory: {config.get_evaluation_directory()}")
         print(f"K-sparse: {config.get_k_sparse()}")
         print(f"Evaluation metrics: {config.get_eval_metrics()}\n")
 
@@ -79,124 +106,136 @@ def main(env_path: str = None, datasets_to_run: list = None,
         print("Initializing sparse retrieval...")
         sparse_retrieval = SparseRetrieval(config, data_loader)
 
-        # Determine datasets to process
+        # Use hard-coded configuration or overrides
+        dataset_version = override_dataset if override_dataset else DATASET_VERSION
+        query_sources = override_query_sources if override_query_sources else QUERY_SOURCES
+        models_to_run = override_models if override_models else MODELS_TO_RUN
+        force_rerun = override_force_rerun if override_force_rerun is not None else FORCE_RERUN
+
+        # Validate dataset
         available_datasets = ["train", "dev-1", "dev-2", "dev-3", "test"]
-        if datasets_to_run is None:
-            # Check which datasets have topic files
-            datasets_to_run = []
-            for dataset in available_datasets:
-                try:
-                    topics = data_loader.load_topics(dataset, "original")
-                    datasets_to_run.append(dataset)
-                except Exception:
-                    continue
-            print(f"Auto-detected datasets: {datasets_to_run}")
-        else:
-            # Validate requested datasets
-            invalid_datasets = [
-                d for d in datasets_to_run if d not in available_datasets]
-            if invalid_datasets:
-                print(f"Warning: Invalid dataset names: {invalid_datasets}")
-                datasets_to_run = [
-                    d for d in datasets_to_run if d in available_datasets]
+        if dataset_version not in available_datasets:
+            raise ValueError(f"Invalid dataset version: {dataset_version}. "
+                             f"Valid options: {available_datasets}")
 
-        if not datasets_to_run:
-            raise ValueError("No valid datasets to process")
-
-        # Validate models
-        if models_to_run is None:
-            models_to_run = SparseRetrieval.SUPPORTED_MODELS
-        else:
+        # Validate models if specified
+        if models_to_run is not None:
             invalid_models = [
                 m for m in models_to_run if m not in SparseRetrieval.SUPPORTED_MODELS]
             if invalid_models:
-                raise ValueError(f"Invalid models: {invalid_models}")
+                raise ValueError(f"Invalid models: {invalid_models}. "
+                                 f"Valid options: {SparseRetrieval.SUPPORTED_MODELS}")
+        else:
+            models_to_run = SparseRetrieval.SUPPORTED_MODELS
 
-        print(f"Processing datasets: {datasets_to_run}")
-        print(f"Using models: {models_to_run}")
-        if query_sources:
-            print(f"Query sources: {query_sources}")
+        # Check if dataset has topics
+        try:
+            test_topics = data_loader.load_topics(dataset_version, "original")
+            print(
+                f"Dataset '{dataset_version}' is available with {len(test_topics)} topics")
+        except Exception as e:
+            raise ValueError(
+                f"Dataset '{dataset_version}' is not available: {e}")
 
-        # Main experiment loop
-        all_results = {}
+        print(f"\n{'='*80}")
+        print(f"EXPERIMENT CONFIGURATION")
+        print(f"{'='*80}")
+        print(f"Dataset version: {dataset_version}")
+        print(f"Models to run: {models_to_run}")
+        print(
+            f"Query sources: {'Auto-detect' if query_sources is None else query_sources}")
+        print(f"Force rerun: {force_rerun}")
 
-        for dataset_version in datasets_to_run:
-            print(f"\n{'='*80}")
-            print(f"Processing Dataset: {dataset_version}")
-            print(f"{'='*80}")
+        # Run experiment for the specified dataset
+        print(f"\n{'='*80}")
+        print(f"Processing Dataset: {dataset_version}")
+        print(f"{'='*80}")
 
-            try:
-                # Auto-detect available query sources for this dataset
-                available_sources = data_loader.get_available_rewritten_sources(
-                    dataset_version)
+        # Auto-detect available query sources for this dataset if not specified
+        if query_sources is None:
+            available_sources = data_loader.get_available_rewritten_sources(
+                dataset_version)
+            print(
+                f"Available query sources for {dataset_version}: {available_sources}")
+            query_sources = available_sources
+        else:
+            # Validate specified query sources
+            available_sources = data_loader.get_available_rewritten_sources(
+                dataset_version)
+            invalid_sources = [
+                s for s in query_sources if s not in available_sources]
+            if invalid_sources:
+                print(f"Warning: Invalid query sources: {invalid_sources}")
+                query_sources = [
+                    s for s in query_sources if s in available_sources]
+
+            if not query_sources:
+                raise ValueError("No valid query sources specified")
+
+        print(f"Testing query sources: {query_sources}")
+
+        # Run experiment
+        dataset_results = sparse_retrieval.run_single_dataset_experiment(
+            dataset_version=dataset_version,
+            query_sources=query_sources,
+            models=models_to_run,
+            force_rerun=force_rerun
+        )
+
+        # Display results summary
+        print(f"\n{'-'*80}")
+        print(f"RESULTS SUMMARY FOR {dataset_version.upper()}")
+        print(f"{'-'*80}")
+
+        for source, experiment_result in dataset_results.items():
+            rewriter_name = sparse_retrieval._get_rewriter_name(source)
+            print(f"\n{rewriter_name} queries:")
+
+            if isinstance(experiment_result, pd.DataFrame) and not experiment_result.empty:
+                print(experiment_result.to_string())
+            elif isinstance(experiment_result, dict):
                 print(
-                    f"Available query sources for {dataset_version}: {available_sources}")
-
-                # Filter by requested sources if specified
-                sources_to_test = query_sources if query_sources else available_sources
-                sources_to_test = [
-                    s for s in sources_to_test if s in available_sources]
-
-                if not sources_to_test:
-                    print(f"No valid query sources for {dataset_version}")
-                    continue
-
-                print(f"Testing query sources: {sources_to_test}")
-
-                # Run multi-source experiment for this dataset
-                dataset_results = sparse_retrieval.run_multi_source_experiment(
-                    dataset_version=dataset_version,
-                    query_sources=sources_to_test,
-                    models=models_to_run,
-                    force_rerun=force_rerun
-                )
-
-                all_results[dataset_version] = dataset_results
-
-                # Display results summary for this dataset
-                print(f"\n{'-'*60}")
-                print(f"Results Summary for {dataset_version}:")
-                print(f"{'-'*60}")
-
-                for source, experiment_df in dataset_results.items():
-                    if not experiment_df.empty:
-                        print(f"\n{source} queries:")
-                        print(experiment_df.to_string())
+                    f"Retrieval completed for {len(experiment_result)} models")
+                for model, results_df in experiment_result.items():
+                    if isinstance(results_df, pd.DataFrame):
+                        print(f"  {model}: {len(results_df)} results")
                     else:
-                        print(f"\n{source} queries: No results")
-
-            except Exception as e:
-                print(f"✗ Error processing dataset {dataset_version}: {e}")
-                continue
+                        print(f"  {model}: No results")
+            else:
+                print("No results")
 
         # Final summary
         print(f"\n{'='*80}")
         print("EXPERIMENT SUMMARY")
         print(f"{'='*80}")
 
-        total_experiments = sum(len(results)
-                                for results in all_results.values())
-        successful_experiments = sum(
-            len([r for r in results.values() if not r.empty])
-            for results in all_results.values()
-        )
+        successful_sources = len([r for r in dataset_results.values()
+                                  if (isinstance(r, pd.DataFrame) and not r.empty) or
+                                  (isinstance(r, dict) and r)])
 
-        print(f"Datasets processed: {len(all_results)}")
-        print(f"Total experiments: {total_experiments}")
-        print(f"Successful experiments: {successful_experiments}")
+        print(f"Dataset processed: {dataset_version}")
+        print(f"Query sources tested: {len(query_sources)}")
+        print(f"Successful experiments: {successful_sources}")
         print(f"Models tested: {models_to_run}")
-        print(f"Results directory: {config.get_run_directory()}")
+        print(f"Sparse run directory: {config.get_sparse_run_directory()}")
+        print(f"Evaluation directory: {config.get_evaluation_directory()}")
 
-        # List all output directories created
-        run_dir = Path(config.get_run_directory())
+        # List output files created
+        run_dir = Path(config.get_sparse_run_directory()) / dataset_version
+        eval_dir = Path(config.get_evaluation_directory()) / \
+            "evals" / dataset_version
+
         if run_dir.exists():
-            output_dirs = [d for d in run_dir.rglob("*") if d.is_dir()]
-            if output_dirs:
-                print(f"\nOutput directories created:")
-                for out_dir in sorted(output_dirs):
-                    rel_path = out_dir.relative_to(run_dir)
-                    file_count = len([f for f in out_dir.glob("*.txt")])
-                    print(f"  {rel_path}/ ({file_count} result files)")
+            run_files = list(run_dir.glob("*.txt"))
+            print(f"\nRun files created: {len(run_files)}")
+            for run_file in sorted(run_files):
+                print(f"  {run_file.name}")
+
+        if eval_dir.exists():
+            eval_files = list(eval_dir.glob("*.csv"))
+            print(f"\nEvaluation files created: {len(eval_files)}")
+            for eval_file in sorted(eval_files):
+                print(f"  {eval_file.name}")
 
         print("\nExperiment completed successfully!")
 
@@ -205,74 +244,10 @@ def main(env_path: str = None, datasets_to_run: list = None,
         sys.exit(1)
 
 
-def run_single_dataset_example(dataset_version: str = "train"):
-    """Example of running experiments for a single dataset."""
-    try:
-        if not pt.started():
-            pt.init()
-
-        print(f"=== Single Dataset Example: {dataset_version} ===")
-
-        env_path = find_env_path()
-        config = ConfigLoader(env_path)
-        data_loader = DataLoader(config)
-        sparse_retrieval = SparseRetrieval(config, data_loader)
-
-        # Run experiments for all available query sources
-        results = sparse_retrieval.run_multi_source_experiment(
-            dataset_version=dataset_version,
-            force_rerun=False
-        )
-
-        print(f"\nResults for {dataset_version}:")
-        for source, experiment_df in results.items():
-            print(f"\n{source}:")
-            if not experiment_df.empty:
-                print(experiment_df)
-            else:
-                print("No results")
-
-    except Exception as e:
-        print(f"Error in single dataset example: {e}")
-
-
-def run_specific_source_example(dataset_version: str = "train", query_source: str = "original"):
-    """Example of running with a specific query source."""
-    try:
-        if not pt.started():
-            pt.init()
-
-        print(
-            f"=== Specific Source Example: {dataset_version} with {query_source} ===")
-
-        env_path = find_env_path()
-        config = ConfigLoader(env_path)
-        data_loader = DataLoader(config)
-
-        # Load topics and qrels
-        topics = data_loader.load_topics(dataset_version, query_source)
-        qrels = data_loader.load_qrels(dataset_version)
-
-        sparse_retrieval = SparseRetrieval(config, data_loader)
-
-        # Run experiment
-        results = sparse_retrieval.run_experiment(
-            topics=topics,
-            qrels=qrels,
-            query_source=query_source,
-            dataset_version=dataset_version
-        )
-
-        print(f"\nResults for {dataset_version} with {query_source} queries:")
-        print(results)
-
-    except Exception as e:
-        print(f"Error in specific source example: {e}")
-
-
-if __name__ == "__main__":
+def run_command_line_mode():
+    """Run with command line arguments (for flexibility)."""
     parser = argparse.ArgumentParser(
-        description="Run PyTerrier sparse retrieval experiments with multiple query sources"
+        description="Run PyTerrier sparse retrieval experiments"
     )
     parser.add_argument(
         "--env",
@@ -280,47 +255,78 @@ if __name__ == "__main__":
         help="Path to env.json (auto-detected if not provided)"
     )
     parser.add_argument(
-        "--datasets",
-        nargs="*",
+        "--dataset",
         choices=["train", "dev-1", "dev-2", "dev-3", "test"],
-        help="Dataset versions to process (all available if not specified)"
+        help="Dataset version to process (overrides hard-coded value)"
     )
     parser.add_argument(
         "--sources",
         nargs="*",
-        help="Query sources to test (e.g., original rewritten_llama summarized). Auto-detected if not specified."
+        help="Query sources to test (e.g., original rewritten_llama summarized)"
     )
     parser.add_argument(
         "--models",
         nargs="*",
         choices=SparseRetrieval.SUPPORTED_MODELS,
-        help="Retrieval models to run (all if not specified)"
+        help="Retrieval models to run (overrides hard-coded value)"
     )
     parser.add_argument(
         "--force-rerun",
         action="store_true",
         help="Force re-running experiments even if cached results exist"
     )
-    parser.add_argument(
-        "--example",
-        choices=["single", "specific"],
-        help="Run example instead of main experiment"
-    )
 
     args = parser.parse_args()
 
-    if args.example == "single":
-        dataset = args.datasets[0] if args.datasets else "train"
-        run_single_dataset_example(dataset)
-    elif args.example == "specific":
-        dataset = args.datasets[0] if args.datasets else "train"
-        source = args.sources[0] if args.sources else "original"
-        run_specific_source_example(dataset, source)
+    main(
+        env_path=args.env,
+        override_dataset=args.dataset,
+        override_query_sources=args.sources,
+        override_models=args.models,
+        override_force_rerun=args.force_rerun
+    )
+
+
+def run_example_configurations():
+    """Examples of different configuration scenarios."""
+    print("=== Example Configurations ===\n")
+
+    examples = [
+        {
+            "name": "Train dataset with all sources",
+            "dataset": "train",
+            "sources": None,  # Auto-detect
+            "models": ["BM25", "PL2"],
+        },
+        {
+            "name": "Dev-1 dataset with original queries only",
+            "dataset": "dev-1",
+            "sources": ["original"],
+            "models": None,  # All models
+        },
+        {
+            "name": "Test dataset with rewritten queries",
+            "dataset": "test",
+            "sources": ["rewritten_llama", "rewritten_mistral"],
+            "models": ["BM25"],
+        }
+    ]
+
+    for i, example in enumerate(examples, 1):
+        print(f"{i}. {example['name']}")
+        print(f"   Dataset: {example['dataset']}")
+        print(f"   Sources: {example['sources']}")
+        print(f"   Models: {example['models']}")
+        print()
+
+
+if __name__ == "__main__":
+    # Check if running with command line arguments
+    if len(sys.argv) > 1:
+        run_command_line_mode()
     else:
-        main(
-            env_path=args.env,
-            datasets_to_run=args.datasets,
-            query_sources=args.sources,
-            models_to_run=args.models,
-            force_rerun=args.force_rerun
-        )
+        # Use hard-coded configuration
+        main()
+
+    # Uncomment to see example configurations
+    # run_example_configurations()

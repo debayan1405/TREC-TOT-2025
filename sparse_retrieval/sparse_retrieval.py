@@ -1,7 +1,7 @@
 """
 Sparse retrieval module for PyTerrier experiments.
 Implements wrapper functions for BM25, PL2, and TF_IDF retrievers with caching.
-Updated with dynamic path creation to prevent overwriting results.
+Updated with enhanced dynamic path creation and evaluation storage.
 """
 import os
 import pandas as pd
@@ -13,7 +13,7 @@ from data_loader import DataLoader
 
 
 class SparseRetrieval:
-    """Handles sparse retrieval algorithms with dynamic path management."""
+    """Handles sparse retrieval algorithms with enhanced path management."""
 
     # Supported sparse retrieval models
     SUPPORTED_MODELS = ["BM25", "PL2", "TF_IDF"]
@@ -30,32 +30,64 @@ class SparseRetrieval:
         self.data_loader = data_loader
         self.index = data_loader.get_index()
 
-        # Ensure run directory exists
+        # Ensure directories exist
         self.config.ensure_run_directory_exists()
+        self.config.ensure_evaluation_directory_exists()
 
-    def _get_output_directory(self, query_source: str, dataset_version: str = "train") -> str:
+    def _get_rewriter_name(self, query_source: str) -> str:
         """
-        Generate dynamic output directory to prevent overwriting.
+        Extract rewriter name from query source.
 
         Args:
             query_source (str): Source of queries (original, rewritten_<model>, summarized)
+
+        Returns:
+            str: Rewriter name for file naming
+        """
+        if query_source == "original":
+            return "original"
+        elif query_source == "summarized":
+            return "summarized"
+        elif query_source.startswith("rewritten_"):
+            return query_source.replace("rewritten_", "")
+        else:
+            return query_source
+
+    def _get_run_output_directory(self, dataset_version: str) -> str:
+        """
+        Generate run output directory based on dataset version.
+
+        Args:
             dataset_version (str): Dataset version (train, dev-1, etc.)
 
         Returns:
-            str: Path to output directory
+            str: Path to run output directory
         """
         base_run_dir = Path(self.config.get_sparse_run_directory())
-
-        # Create hierarchical structure: run_directory/dataset_version/query_source/
-        output_dir = base_run_dir / dataset_version / query_source
+        output_dir = base_run_dir / dataset_version
         output_dir.mkdir(parents=True, exist_ok=True)
-
         return str(output_dir)
 
-    def _get_output_filename(self, algorithm_name: str, query_source: str,
-                             dataset_version: str = "train") -> str:
+    def _get_eval_output_directory(self, dataset_version: str) -> str:
         """
-        Generate output filename for algorithm results with dynamic paths.
+        Generate evaluation output directory based on dataset version.
+
+        Args:
+            dataset_version (str): Dataset version (train, dev-1, etc.)
+
+        Returns:
+            str: Path to evaluation output directory
+        """
+        base_eval_dir = Path(self.config.get_evaluation_directory())
+        eval_dir = base_eval_dir / "evals" / dataset_version
+        eval_dir.mkdir(parents=True, exist_ok=True)
+        return str(eval_dir)
+
+    def _get_run_filename(self, algorithm_name: str, query_source: str,
+                          dataset_version: str) -> str:
+        """
+        Generate run filename following the naming convention:
+        <rewriter_name>_<dataset_version>_<algorithm_name>_<k_sparse>.txt
 
         Args:
             algorithm_name (str): Name of the algorithm
@@ -65,15 +97,37 @@ class SparseRetrieval:
         Returns:
             str: Full path to output file
         """
-        output_dir = self._get_output_directory(query_source, dataset_version)
+        output_dir = self._get_run_output_directory(dataset_version)
+        rewriter_name = self._get_rewriter_name(query_source)
         k_sparse = self.config.get_k_sparse()
-        filename = f"{algorithm_name.lower()}_{k_sparse}.txt"
+
+        filename = f"{rewriter_name}_{dataset_version}_{algorithm_name.lower()}_{k_sparse}.txt"
         return os.path.join(output_dir, filename)
 
-    def _save_results(self, results_df: pd.DataFrame, algorithm_name: str,
-                      query_source: str, dataset_version: str = "train") -> None:
+    def _get_eval_filename(self, algorithm_name: str, query_source: str,
+                           dataset_version: str) -> str:
         """
-        Save results dataframe to text file with dynamic naming.
+        Generate evaluation filename following the naming convention:
+        <rewriter_name>_<algorithm_name>_<dataset_version>_eval.csv
+
+        Args:
+            algorithm_name (str): Name of the algorithm
+            query_source (str): Source of queries
+            dataset_version (str): Dataset version
+
+        Returns:
+            str: Full path to evaluation file
+        """
+        eval_dir = self._get_eval_output_directory(dataset_version)
+        rewriter_name = self._get_rewriter_name(query_source)
+
+        filename = f"{rewriter_name}_{algorithm_name.lower()}_{dataset_version}_eval.csv"
+        return os.path.join(eval_dir, filename)
+
+    def _save_run_results(self, results_df: pd.DataFrame, algorithm_name: str,
+                          query_source: str, dataset_version: str) -> None:
+        """
+        Save run results dataframe to text file with enhanced naming.
 
         Args:
             results_df (pd.DataFrame): Results dataframe
@@ -81,7 +135,7 @@ class SparseRetrieval:
             query_source (str): Source of queries
             dataset_version (str): Dataset version
         """
-        output_file = self._get_output_filename(
+        output_file = self._get_run_filename(
             algorithm_name, query_source, dataset_version)
         k_sparse = self.config.get_k_sparse()
 
@@ -94,14 +148,16 @@ class SparseRetrieval:
         else:
             top_k_results = results_df.head(k_sparse)
 
-        # Save to tab-separated text file in TREC format if possible
+        # Save to tab-separated text file in TREC format
         if all(col in top_k_results.columns for col in ['qid', 'docno', 'rank', 'score']):
             # TREC format: qid Q0 docno rank score run_name
             trec_format = top_k_results[[
                 'qid', 'docno', 'rank', 'score']].copy()
             trec_format.insert(1, 'Q0', 'Q0')  # Add Q0 column
-            trec_format.insert(
-                5, 'run_name', f"{algorithm_name}_{query_source}_{dataset_version}")
+
+            rewriter_name = self._get_rewriter_name(query_source)
+            run_name = f"{rewriter_name}_{dataset_version}_{algorithm_name.lower()}"
+            trec_format.insert(5, 'run_name', run_name)
 
             trec_format.to_csv(
                 output_file,
@@ -118,13 +174,32 @@ class SparseRetrieval:
                 header=True
             )
 
-        print(
-            f"Saved {len(top_k_results)} results for {algorithm_name} ({query_source}, {dataset_version}) to {output_file}")
+        print(f"Saved {len(top_k_results)} run results for {algorithm_name} "
+              f"({query_source}, {dataset_version}) to {output_file}")
 
-    def _load_cached_results(self, algorithm_name: str, query_source: str,
-                             dataset_version: str = "train") -> Optional[pd.DataFrame]:
+    def _save_eval_results(self, eval_df: pd.DataFrame, algorithm_name: str,
+                           query_source: str, dataset_version: str) -> None:
         """
-        Load cached results if they exist.
+        Save evaluation results to CSV file.
+
+        Args:
+            eval_df (pd.DataFrame): Evaluation results dataframe
+            algorithm_name (str): Name of the algorithm
+            query_source (str): Source of queries
+            dataset_version (str): Dataset version
+        """
+        eval_file = self._get_eval_filename(
+            algorithm_name, query_source, dataset_version)
+
+        eval_df.to_csv(eval_file, index=True)
+
+        print(f"Saved evaluation results for {algorithm_name} "
+              f"({query_source}, {dataset_version}) to {eval_file}")
+
+    def _load_cached_run_results(self, algorithm_name: str, query_source: str,
+                                 dataset_version: str) -> Optional[pd.DataFrame]:
+        """
+        Load cached run results if they exist.
 
         Args:
             algorithm_name (str): Name of the algorithm
@@ -134,7 +209,7 @@ class SparseRetrieval:
         Returns:
             pd.DataFrame or None: Cached results or None if not found
         """
-        output_file = self._get_output_filename(
+        output_file = self._get_run_filename(
             algorithm_name, query_source, dataset_version)
 
         if os.path.exists(output_file):
@@ -155,8 +230,8 @@ class SparseRetrieval:
                 # Validate expected columns
                 expected_cols = ["qid", "docno", "score", "rank"]
                 if all(col in cached_df.columns for col in expected_cols):
-                    print(
-                        f"Loaded cached results for {algorithm_name} ({query_source}, {dataset_version}) from {output_file}")
+                    print(f"Loaded cached run results for {algorithm_name} "
+                          f"({query_source}, {dataset_version}) from {output_file}")
                     return cached_df
                 else:
                     print(
@@ -164,7 +239,7 @@ class SparseRetrieval:
                     return None
             except Exception as e:
                 print(
-                    f"Warning: Error loading cached results for {algorithm_name}: {e}. Re-running...")
+                    f"Warning: Error loading cached run results for {algorithm_name}: {e}. Re-running...")
                 return None
 
         return None
@@ -186,9 +261,9 @@ class SparseRetrieval:
         return pt.terrier.Retriever(self.index, wmodel=wmodel)
 
     def run_retrieval(self, wmodel: str, topics: pd.DataFrame, query_source: str,
-                      dataset_version: str = "train", force_rerun: bool = False) -> pd.DataFrame:
+                      dataset_version: str, force_rerun: bool = False) -> pd.DataFrame:
         """
-        Run sparse retrieval for given weighting model with dynamic path management.
+        Run sparse retrieval for given weighting model with enhanced path management.
 
         Args:
             wmodel (str): Weighting model name (BM25, PL2, TF_IDF)
@@ -202,7 +277,7 @@ class SparseRetrieval:
         """
         # Check for cached results first (unless forced to rerun)
         if not force_rerun:
-            cached_results = self._load_cached_results(
+            cached_results = self._load_cached_run_results(
                 wmodel, query_source, dataset_version)
             if cached_results is not None:
                 # Add query text if not present
@@ -211,8 +286,9 @@ class SparseRetrieval:
                         topics[['qid', 'query']], on='qid', how='left')
                 return cached_results
 
+        rewriter_name = self._get_rewriter_name(query_source)
         print(
-            f"Running {wmodel} retrieval on {query_source} queries for {dataset_version}...")
+            f"Running {wmodel} retrieval on {rewriter_name} queries for {dataset_version}...")
 
         # Create retriever
         retriever = self._create_retriever(wmodel)
@@ -246,8 +322,9 @@ class SparseRetrieval:
             results = results.sort_values(
                 ['qid', 'rank']).reset_index(drop=True)
 
-            # Save results with dynamic path
-            self._save_results(results, wmodel, query_source, dataset_version)
+            # Save results with enhanced naming
+            self._save_run_results(
+                results, wmodel, query_source, dataset_version)
 
             return results
 
@@ -255,7 +332,7 @@ class SparseRetrieval:
             raise RuntimeError(f"Error running {wmodel} retrieval: {e}")
 
     def run_all_models(self, topics: pd.DataFrame, query_source: str,
-                       dataset_version: str = "train", force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
+                       dataset_version: str, force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
         """
         Run all supported sparse retrieval models.
 
@@ -269,13 +346,14 @@ class SparseRetrieval:
             Dict[str, pd.DataFrame]: Dictionary mapping model names to result dataframes
         """
         results = {}
+        rewriter_name = self._get_rewriter_name(query_source)
 
         for model in self.SUPPORTED_MODELS:
             try:
                 results[model] = self.run_retrieval(
                     model, topics, query_source, dataset_version, force_rerun)
                 print(
-                    f"✓ Successfully completed {model} for {query_source} on {dataset_version}")
+                    f"✓ Successfully completed {model} for {rewriter_name} on {dataset_version}")
             except Exception as e:
                 print(f"✗ Error running {model}: {e}")
                 continue
@@ -283,10 +361,10 @@ class SparseRetrieval:
         return results
 
     def run_experiment(self, topics: pd.DataFrame, qrels: pd.DataFrame, query_source: str,
-                       dataset_version: str = "train", models: Optional[List[str]] = None,
+                       dataset_version: str, models: Optional[List[str]] = None,
                        force_rerun: bool = False) -> pd.DataFrame:
         """
-        Run PyTerrier experiment with multiple retrievers and dynamic result paths.
+        Run PyTerrier experiment with multiple retrievers and enhanced result storage.
 
         Args:
             topics (pd.DataFrame): Topics dataframe
@@ -310,11 +388,13 @@ class SparseRetrieval:
         # Create retrievers
         retrievers = []
         retriever_names = []
+        rewriter_name = self._get_rewriter_name(query_source)
+
         for model in models:
             try:
                 retriever = self._create_retriever(model)
                 retrievers.append(retriever)
-                retriever_names.append(f"{model}_{query_source}")
+                retriever_names.append(f"{rewriter_name}_{model}")
             except Exception as e:
                 print(f"Warning: Could not create {model} retriever: {e}")
                 continue
@@ -334,18 +414,29 @@ class SparseRetrieval:
                 names=retriever_names
             )
 
-            # Save experiment results with dynamic naming
-            experiment_output_dir = self._get_output_directory(
-                query_source, dataset_version)
-            experiment_file = Path(
-                experiment_output_dir) / f"experiment_results_{dataset_version}_{query_source}.csv"
-            experiment_results.to_csv(experiment_file, index=True)
-            print(f"Experiment results saved to: {experiment_file}")
+            # Save individual evaluation results for each model
+            for i, model in enumerate(models):
+                if i < len(experiment_results):
+                    # Extract single model results
+                    single_model_eval = experiment_results.iloc[[i]]
+                    self._save_eval_results(
+                        single_model_eval, model, query_source, dataset_version)
 
-            # Cache individual results if not already cached
+            # Save combined experiment results
+            combined_eval_dir = self._get_eval_output_directory(
+                dataset_version)
+            combined_eval_file = Path(
+                combined_eval_dir) / f"combined_{rewriter_name}_{dataset_version}_eval.csv"
+            experiment_results.to_csv(combined_eval_file, index=True)
+            print(
+                f"Combined experiment results saved to: {combined_eval_file}")
+
+            # Cache individual run results if not already cached
             if not force_rerun:
                 for model in models:
-                    if not os.path.exists(self._get_output_filename(model, query_source, dataset_version)):
+                    run_file = self._get_run_filename(
+                        model, query_source, dataset_version)
+                    if not os.path.exists(run_file):
                         try:
                             self.run_retrieval(
                                 model, topics, query_source, dataset_version, force_rerun=False)
@@ -358,12 +449,12 @@ class SparseRetrieval:
         except Exception as e:
             raise RuntimeError(f"Error running experiment: {e}")
 
-    def run_multi_source_experiment(self, dataset_version: str = "train",
-                                    query_sources: Optional[List[str]] = None,
-                                    models: Optional[List[str]] = None,
-                                    force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
+    def run_single_dataset_experiment(self, dataset_version: str,
+                                      query_sources: Optional[List[str]] = None,
+                                      models: Optional[List[str]] = None,
+                                      force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
         """
-        Run experiments across multiple query sources for a dataset version.
+        Run experiments across multiple query sources for a single dataset version.
 
         Args:
             dataset_version (str): Dataset version to process
@@ -374,8 +465,14 @@ class SparseRetrieval:
         Returns:
             Dict[str, pd.DataFrame]: Mapping of query source to experiment results
         """
-        # Load qrels
-        qrels = self.data_loader.load_qrels(dataset_version)
+        # Load qrels (only for datasets that have qrels)
+        qrels_versions = ["train", "dev-1", "dev-2", "dev-3"]
+        if dataset_version in qrels_versions:
+            qrels = self.data_loader.load_qrels(dataset_version)
+        else:
+            print(
+                f"Warning: No qrels available for {dataset_version}. Skipping evaluation.")
+            qrels = None
 
         # Auto-detect available query sources if not specified
         if query_sources is None:
@@ -388,9 +485,10 @@ class SparseRetrieval:
         results = {}
 
         for query_source in query_sources:
+            rewriter_name = self._get_rewriter_name(query_source)
             print(f"\n{'='*60}")
             print(
-                f"Running experiment: {dataset_version} with {query_source} queries")
+                f"Running experiment: {dataset_version} with {rewriter_name} queries")
             print(f"{'='*60}")
 
             try:
@@ -398,23 +496,35 @@ class SparseRetrieval:
                 topics = self.data_loader.load_topics(
                     dataset_version, query_source)
 
-                # Validate data consistency
-                self.data_loader.validate_data_consistency(
-                    topics, qrels, dataset_version)
+                # Validate data consistency only if qrels exist
+                if qrels is not None:
+                    self.data_loader.validate_data_consistency(
+                        topics, qrels, dataset_version)
 
-                # Run experiment
-                experiment_result = self.run_experiment(
-                    topics=topics,
-                    qrels=qrels,
-                    query_source=query_source,
-                    dataset_version=dataset_version,
-                    models=models,
-                    force_rerun=force_rerun
-                )
+                    # Run experiment with evaluation
+                    experiment_result = self.run_experiment(
+                        topics=topics,
+                        qrels=qrels,
+                        query_source=query_source,
+                        dataset_version=dataset_version,
+                        models=models,
+                        force_rerun=force_rerun
+                    )
+                    results[query_source] = experiment_result
+                else:
+                    # Run retrieval only (no evaluation)
+                    retrieval_results = self.run_all_models(
+                        topics=topics,
+                        query_source=query_source,
+                        dataset_version=dataset_version,
+                        force_rerun=force_rerun
+                    )
+                    results[query_source] = retrieval_results
+                    print(
+                        f"✓ Successfully completed retrieval for {rewriter_name} (no evaluation)")
 
-                results[query_source] = experiment_result
                 print(
-                    f"✓ Successfully completed experiment for {query_source}")
+                    f"✓ Successfully completed experiment for {rewriter_name}")
 
             except Exception as e:
                 print(f"✗ Error in experiment for {query_source}: {e}")

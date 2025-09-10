@@ -67,7 +67,7 @@ class ConfigLoader:
 
         # Required path keys
         required_path_keys = [
-            "index_path", "run_directory"
+            "index_path", "sparse_run_directory"
         ]
 
         # Required topic paths
@@ -190,13 +190,25 @@ class ConfigLoader:
         """Get dev-3 qrels file path."""
         return self.config["paths"]["dev3_qrels_path"]
 
-    def get_run_directory(self) -> str:
-        """Get run directory path."""
-        return self.config["paths"]["run_directory"]
+    def get_sparse_run_directory(self) -> str:
+        """Get sparse run directory path."""
+        return self.config["paths"]["sparse_run_directory"]
+
+    def get_combined_run_directory(self) -> str:
+        """Get combined run directory path."""
+        return self.config["paths"]["combined_run_directory"]
+
+    def get_evaluation_directory(self) -> str:
+        """Get evaluation directory path."""
+        return self.config["paths"]["evaluation_directory"]
 
     def get_k_sparse(self) -> int:
         """Get k_sparse value."""
         return self.config["k_sparse"]
+
+    def get_rrf_k(self) -> int:
+        """Get RRF_K value."""
+        return self.config.get("RRF_K", 2000)
 
     def get_eval_metrics(self) -> List[str]:
         """Get evaluation metrics."""
@@ -204,8 +216,18 @@ class ConfigLoader:
 
     def ensure_run_directory_exists(self) -> None:
         """Create run directory if it doesn't exist."""
-        run_dir = Path(self.get_run_directory())
+        run_dir = Path(self.get_sparse_run_directory())
         run_dir.mkdir(parents=True, exist_ok=True)
+
+    def ensure_combined_run_directory_exists(self) -> None:
+        """Create combined run directory if it doesn't exist."""
+        combined_dir = Path(self.get_combined_run_directory())
+        combined_dir.mkdir(parents=True, exist_ok=True)
+
+    def ensure_evaluation_directory_exists(self) -> None:
+        """Create evaluation directory if it doesn't exist."""
+        eval_dir = Path(self.get_evaluation_directory())
+        eval_dir.mkdir(parents=True, exist_ok=True)
 
     def get_rewritten_queries_directory(self) -> str:
         """Get rewritten queries directory path."""
