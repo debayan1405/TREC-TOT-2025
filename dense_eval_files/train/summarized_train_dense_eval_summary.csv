@@ -1,0 +1,5 @@
+,name,ndcg_cut_10,ndcg_cut_1000,recall_1000,P_10
+0,summarized_train_all-mpnet-base-v2_reranked,0.0,0.04270930508311475,0.35664335664335667,0.0
+1,summarized_train_multi-qa-mpnet-base-dot-v1_reranked,0.0,0.04489594531709538,0.3916083916083916,0.0
+2,summarized_train_all-distilroberta-v1_reranked,0.0,0.03946955053758253,0.35664335664335667,0.0
+3,summarized_train_dense_fused,0.0,0.03928095723666124,0.34965034965034963,0.0

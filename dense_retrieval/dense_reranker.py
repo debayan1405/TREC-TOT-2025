@@ -26,7 +26,28 @@ class DenseReranker:
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         print(f"Initializing dense re-ranker with model: {self.model_name} on device: {self.device}")
+        
+        # Optimize for high-end hardware (700+ GB RAM, 2x A6000 GPUs)
         self.model = SentenceTransformer(self.model_name, device=self.device)
+        
+        # Enable optimizations for maximum performance
+        if self.device == 'cuda':
+            # Use compilation for faster inference
+            try:
+                self.model = torch.compile(self.model, mode='max-autotune')
+                print("✓ Model compiled with max-autotune for optimal performance")
+            except:
+                print("Note: torch.compile not available, using standard model")
+            
+            # Set optimal batch size for A6000 GPUs (48GB VRAM each)
+            self.batch_size = 512  # Large batch for maximum throughput
+            
+            # Enable tensor cores and mixed precision
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        else:
+            self.batch_size = 64
         
         # Load PyTerrier index for fetching document text
         self.index = self.data_loader.get_index()
@@ -113,9 +134,21 @@ class DenseReranker:
                 doc_texts_clean.append(doc_text_clean)
             
             try:
-                # Encode query and document texts with error handling
-                query_embedding = self.model.encode(query_text_clean, convert_to_tensor=True)
-                doc_embeddings = self.model.encode(doc_texts_clean, convert_to_tensor=True)
+                # Encode query and document texts with batch processing
+                query_embedding = self.model.encode(
+                    query_text_clean, 
+                    convert_to_tensor=True,
+                    show_progress_bar=False,
+                    batch_size=1
+                )
+                
+                # Batch encode documents for maximum throughput
+                doc_embeddings = self.model.encode(
+                    doc_texts_clean, 
+                    convert_to_tensor=True,
+                    show_progress_bar=False,
+                    batch_size=min(self.batch_size, len(doc_texts_clean))
+                )
                 
                 # Compute cosine similarity
                 scores = cos_sim(query_embedding, doc_embeddings)[0].cpu().tolist()
