@@ -1,0 +1,353 @@
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ mkdir -p debug_output
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ echo "🔍 Debugging Mistral reranking with all-mpnet-base-v2..."
+python debug_reranking.py \
+  --reranked_run dense_run_files/train/mistral_train_all-mpnet-base-v2_reranked.txt \
+  --fused_run fused_run_files/train/mistral_train_fused.txt \
+  --qrels qrel/train-2025-qrel.txt \
+  --output_dir debug_output/mistral_mpnet
+
+echo -e "\n=================================="
+🔍 Debugging Mistral reranking with all-mpnet-base-v2...
+python: can't open file '/home/ugdf8/IRIS/TREC-TOT-2025/debug_reranking.py': [Errno 2] No such file or directory
+
+==================================
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ echo "🔍 Debugging Mistral reranking with all-mpnet-base-v2..."
+python dense_retrieval/debug_reranking.py \
+  --reranked_run dense_run_files/train/mistral_train_all-mpnet-base-v2_reranked.txt \
+  --fused_run fused_run_files/train/mistral_train_fused.txt \
+  --qrels qrel/train-2025-qrel.txt \
+  --output_dir debug_output/mistral_mpnet
+
+echo -e "\n=================================="
+🔍 Debugging Mistral reranking with all-mpnet-base-v2...
+🔍 DENSE RERANKING DEBUG ANALYSIS
+==================================================
+Loading QRELs from: qrel/train-2025-qrel.txt
+✅ Loaded 143 relevant (qid, docno) pairs
+Loading reranked run from: dense_run_files/train/mistral_train_all-mpnet-base-v2_reranked.txt
+✅ Loaded reranked run with 189538 entries
+
+=== OUTPUT FORMAT VALIDATION ===
+✅ Output format validation passed
+
+=== DOCID ALIGNMENT CHECK (Top-10) ===
+Total top-10 (qid, docno) pairs in run: 1430
+Pairs that match QREL document IDs: 1
+Alignment rate: 0.07%
+
+Example for query 1007:
+Run top-5 docnos: ['4515530', '41207042', '4106832', '40460245', '43042010']
+QREL docnos for this query: ['3737258']
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0070
+Recall@100: 0.0350
+Recall@1000: 0.4476
+Recall@2000: 0.5804
+
+=== SCORE DISTRIBUTION ANALYSIS ===
+Score statistics:
+  Min: -0.130774
+  Max: 0.194052
+  Mean: 0.024779
+  Std: 0.043111
+  Unique values: 112360
+Score distribution plot saved to: debug_output/mistral_mpnet/score_distribution.png
+
+=== CANDIDATE SET QUALITY CHECK ===
+Queries with ≥1 relevant doc in top-10: 18/143 (12.6%)
+Queries with ≥1 relevant doc in top-100: 40/143 (28.0%)
+Queries with ≥1 relevant doc in top-1000: 77/143 (53.8%)
+Queries with ≥1 relevant doc in top-2000: 83/143 (58.0%)
+
+=== BEFORE vs AFTER RERANKING COMPARISON ===
+BEFORE RERANKING (Fused):
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.1259
+Recall@100: 0.2797
+Recall@1000: 0.5385
+Recall@2000: 0.5804
+
+AFTER RERANKING:
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0070
+Recall@100: 0.0350
+Recall@1000: 0.4476
+Recall@2000: 0.5804
+
+CHANGE (After - Before):
+Recall@10: -0.1189
+Recall@100: -0.2448
+Recall@1000: -0.0909
+Recall@2000: +0.0000
+
+🏁 DIAGNOSIS SUMMARY:
+==============================
+🚨 CRITICAL: Document ID alignment is very poor (<10%)
+   → Check if reranker uses different document ID format
+   → Verify document metadata extraction in dense_reranker.py
+
+💡 RECOMMENDED NEXT STEPS:
+1. Fix document ID alignment if critical
+2. Consider using cross-encoder instead of bi-encoder for reranking
+3. Increase candidate set size if recall@2000 is low
+4. Fine-tune reranking model on your domain/QRELs
+
+==================================
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ echo "🔍 Debugging Llama reranking with all-mpnet-base-v2..."
+python dense_retrieval/debug_reranking.py \
+  --reranked_run dense_run_files/train/llama_train_all-mpnet-base-v2_reranked.txt \
+  --fused_run fused_run_files/train/llama_train_fused.txt \
+  --qrels qrel/train-2025-qrel.txt \
+  --output_dir debug_output/llama_mpnet
+
+echo -e "\n=================================="
+🔍 Debugging Llama reranking with all-mpnet-base-v2...
+🔍 DENSE RERANKING DEBUG ANALYSIS
+==================================================
+Loading QRELs from: qrel/train-2025-qrel.txt
+✅ Loaded 143 relevant (qid, docno) pairs
+Loading reranked run from: dense_run_files/train/llama_train_all-mpnet-base-v2_reranked.txt
+✅ Loaded reranked run with 187134 entries
+
+=== OUTPUT FORMAT VALIDATION ===
+✅ Output format validation passed
+
+=== DOCID ALIGNMENT CHECK (Top-10) ===
+Total top-10 (qid, docno) pairs in run: 1430
+Pairs that match QREL document IDs: 0
+Alignment rate: 0.00%
+
+Example for query 1007:
+Run top-5 docnos: ['4520121', '1000035', '41118327', '4044836', '41159501']
+QREL docnos for this query: ['3737258']
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0000
+Recall@100: 0.0280
+Recall@1000: 0.3427
+Recall@2000: 0.4336
+
+=== SCORE DISTRIBUTION ANALYSIS ===
+Score statistics:
+  Min: -0.115300
+  Max: 0.285423
+  Mean: 0.042683
+  Std: 0.056623
+  Unique values: 121423
+Score distribution plot saved to: debug_output/llama_mpnet/score_distribution.png
+
+=== CANDIDATE SET QUALITY CHECK ===
+Queries with ≥1 relevant doc in top-10: 15/143 (10.5%)
+Queries with ≥1 relevant doc in top-100: 32/143 (22.4%)
+Queries with ≥1 relevant doc in top-1000: 60/143 (42.0%)
+Queries with ≥1 relevant doc in top-2000: 62/143 (43.4%)
+
+=== BEFORE vs AFTER RERANKING COMPARISON ===
+BEFORE RERANKING (Fused):
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.1049
+Recall@100: 0.2238
+Recall@1000: 0.4196
+Recall@2000: 0.4336
+
+AFTER RERANKING:
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0000
+Recall@100: 0.0280
+Recall@1000: 0.3427
+Recall@2000: 0.4336
+
+CHANGE (After - Before):
+Recall@10: -0.1049
+Recall@100: -0.1958
+Recall@1000: -0.0769
+Recall@2000: +0.0000
+
+🏁 DIAGNOSIS SUMMARY:
+==============================
+🚨 CRITICAL: Document ID alignment is very poor (<10%)
+   → Check if reranker uses different document ID format
+   → Verify document metadata extraction in dense_reranker.py
+
+💡 RECOMMENDED NEXT STEPS:
+1. Fix document ID alignment if critical
+2. Consider using cross-encoder instead of bi-encoder for reranking
+3. Increase candidate set size if recall@2000 is low
+4. Fine-tune reranking model on your domain/QRELs
+
+==================================
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ echo "🔍 Debugging Qwen reranking with all-mpnet-base-v2..."
+python dense_retrieval/debug_reranking.py \
+  --reranked_run dense_run_files/train/qwen_train_all-mpnet-base-v2_reranked.txt \
+  --fused_run fused_run_files/train/qwen_train_fused.txt \
+  --qrels qrel/train-2025-qrel.txt \
+  --output_dir debug_output/qwen_mpnet
+
+echo -e "\n=================================="
+🔍 Debugging Qwen reranking with all-mpnet-base-v2...
+🔍 DENSE RERANKING DEBUG ANALYSIS
+==================================================
+Loading QRELs from: qrel/train-2025-qrel.txt
+✅ Loaded 143 relevant (qid, docno) pairs
+Loading reranked run from: dense_run_files/train/qwen_train_all-mpnet-base-v2_reranked.txt
+✅ Loaded reranked run with 189777 entries
+
+=== OUTPUT FORMAT VALIDATION ===
+✅ Output format validation passed
+
+=== DOCID ALIGNMENT CHECK (Top-10) ===
+Total top-10 (qid, docno) pairs in run: 1430
+Pairs that match QREL document IDs: 0
+Alignment rate: 0.00%
+
+Example for query 1007:
+Run top-5 docnos: ['4408863', '1000035', '41040217', '460865', '33845020']
+QREL docnos for this query: ['3737258']
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0000
+Recall@100: 0.0210
+Recall@1000: 0.3776
+Recall@2000: 0.4755
+
+=== SCORE DISTRIBUTION ANALYSIS ===
+Score statistics:
+  Min: -0.133064
+  Max: 0.233229
+  Mean: 0.031175
+  Std: 0.048167
+  Unique values: 116405
+Score distribution plot saved to: debug_output/qwen_mpnet/score_distribution.png
+
+=== CANDIDATE SET QUALITY CHECK ===
+Queries with ≥1 relevant doc in top-10: 17/143 (11.9%)
+Queries with ≥1 relevant doc in top-100: 31/143 (21.7%)
+Queries with ≥1 relevant doc in top-1000: 64/143 (44.8%)
+Queries with ≥1 relevant doc in top-2000: 68/143 (47.6%)
+
+=== BEFORE vs AFTER RERANKING COMPARISON ===
+BEFORE RERANKING (Fused):
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.1189
+Recall@100: 0.2168
+Recall@1000: 0.4476
+Recall@2000: 0.4755
+
+AFTER RERANKING:
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0000
+Recall@100: 0.0210
+Recall@1000: 0.3776
+Recall@2000: 0.4755
+
+CHANGE (After - Before):
+Recall@10: -0.1189
+Recall@100: -0.1958
+Recall@1000: -0.0699
+Recall@2000: +0.0000
+
+🏁 DIAGNOSIS SUMMARY:
+==============================
+🚨 CRITICAL: Document ID alignment is very poor (<10%)
+   → Check if reranker uses different document ID format
+   → Verify document metadata extraction in dense_reranker.py
+
+💡 RECOMMENDED NEXT STEPS:
+1. Fix document ID alignment if critical
+2. Consider using cross-encoder instead of bi-encoder for reranking
+3. Increase candidate set size if recall@2000 is low
+4. Fine-tune reranking model on your domain/QRELs
+
+==================================
+(trec-rag) ugdf8@rs7fy1v94:~/IRIS/TREC-TOT-2025$ echo "🔍 Debugging Mistral DENSE FUSED (post-fusion)..."
+python dense_retrieval/debug_reranking.py \
+  --reranked_run dense_run_files/train/mistral_train_dense_fused.txt \
+  --fused_run fused_run_files/train/mistral_train_fused.txt \
+  --qrels qrel/train-2025-qrel.txt \
+  --output_dir debug_output/mistral_dense_fused
+
+echo "✅ Debug analysis complete! Check the debug_output/ directory for results and plots." 
+🔍 Debugging Mistral DENSE FUSED (post-fusion)...
+🔍 DENSE RERANKING DEBUG ANALYSIS
+==================================================
+Loading QRELs from: qrel/train-2025-qrel.txt
+✅ Loaded 143 relevant (qid, docno) pairs
+Loading reranked run from: dense_run_files/train/mistral_train_dense_fused.txt
+✅ Loaded reranked run with 189538 entries
+
+=== OUTPUT FORMAT VALIDATION ===
+✅ Output format validation passed
+
+=== DOCID ALIGNMENT CHECK (Top-10) ===
+Total top-10 (qid, docno) pairs in run: 1430
+Pairs that match QREL document IDs: 1
+Alignment rate: 0.07%
+
+Example for query 1007:
+Run top-5 docnos: ['40460245', '41207042', '4106832', '43042010', '4515530']
+QREL docnos for this query: ['3737258']
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0070
+Recall@100: 0.0350
+Recall@1000: 0.4476
+Recall@2000: 0.5804
+
+=== SCORE DISTRIBUTION ANALYSIS ===
+Score statistics:
+  Min: 0.000840
+  Max: 0.001499
+  Mean: 0.001150
+  Std: 0.000120
+  Unique values: 656
+⚠️  WARNING: Very few unique scores. Reranker may be producing constant output.
+Score distribution plot saved to: debug_output/mistral_dense_fused/score_distribution.png
+
+=== CANDIDATE SET QUALITY CHECK ===
+Queries with ≥1 relevant doc in top-10: 18/143 (12.6%)
+Queries with ≥1 relevant doc in top-100: 40/143 (28.0%)
+Queries with ≥1 relevant doc in top-1000: 77/143 (53.8%)
+Queries with ≥1 relevant doc in top-2000: 83/143 (58.0%)
+
+=== BEFORE vs AFTER RERANKING COMPARISON ===
+BEFORE RERANKING (Fused):
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.1259
+Recall@100: 0.2797
+Recall@1000: 0.5385
+Recall@2000: 0.5804
+
+AFTER RERANKING:
+
+=== RECALL@K ANALYSIS ===
+Recall@10: 0.0070
+Recall@100: 0.0350
+Recall@1000: 0.4476
+Recall@2000: 0.5804
+
+CHANGE (After - Before):
+Recall@10: -0.1189
+Recall@100: -0.2448
+Recall@1000: -0.0909
+Recall@2000: +0.0000
+
+🏁 DIAGNOSIS SUMMARY:
+==============================
+🚨 CRITICAL: Document ID alignment is very poor (<10%)
+   → Check if reranker uses different document ID format
+   → Verify document metadata extraction in dense_reranker.py
+
+💡 RECOMMENDED NEXT STEPS:
+1. Fix document ID alignment if critical
+2. Consider using cross-encoder instead of bi-encoder for reranking
+3. Increase candidate set size if recall@2000 is low
+4. Fine-tune reranking model on your domain/QRELs
+✅ Debug analysis complete! Check the debug_output/ directory for results and plots.
