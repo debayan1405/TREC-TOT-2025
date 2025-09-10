@@ -232,3 +232,11 @@ class ConfigLoader:
     def get_rewritten_queries_directory(self) -> str:
         """Get rewritten queries directory path."""
         return self.config["paths"]["rewritten_queries_directory"]
+
+    def get_dense_run_directory(self) -> str:
+        """Get dense run directory path."""
+        return self.config["paths"]["dense_run_directory"]
+
+    def get_dense_eval_directory(self) -> str:
+        """Get dense evaluation directory path."""
+        return self.config["paths"]["dense_eval_directory"]

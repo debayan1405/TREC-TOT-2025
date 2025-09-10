@@ -6,9 +6,17 @@ Main execution script for dense re-ranking experiments.
 """
 import argparse
 import sys
+import os
+import torch
 from pathlib import Path
 import pandas as pd
 import pyterrier as pt
+
+# Optimize for maximum performance on high-end hardware
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())  # Use all CPU cores
+os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
+os.environ["NUMEXPR_NUM_THREADS"] = str(os.cpu_count())
+torch.set_num_threads(os.cpu_count())  # Use all CPU threads for PyTorch
 
 # Add project root to the Python path
 project_root = Path(__file__).resolve().parent.parent
