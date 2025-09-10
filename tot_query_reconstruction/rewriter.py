@@ -13,6 +13,40 @@ logger = logging.getLogger(__name__)
 
 
 # -----------------------
+# Check existing output files
+# -----------------------
+def check_existing_output(model_name: str, dataset_version: str, output_dir: str) -> bool:
+    """
+    Check if output file already exists for a model-dataset combination.
+    
+    Args:
+        model_name: Name of the model
+        dataset_version: Dataset version (train, dev-1, etc.)
+        output_dir: Output directory
+        
+    Returns:
+        bool: True if file exists and is non-empty, False otherwise
+    """
+    outpath = os.path.join(output_dir, f"{model_name}_{dataset_version}_rewritten_queries.jsonl")
+    
+    if os.path.exists(outpath):
+        # Check if file is non-empty
+        try:
+            with open(outpath, 'r', encoding='utf-8') as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    # Count total lines for verification
+                    f.seek(0)
+                    line_count = sum(1 for _ in f)
+                    logger.info(f"Found existing output: {outpath} with {line_count} lines")
+                    return True
+        except Exception as e:
+            logger.warning(f"Error reading existing file {outpath}: {e}")
+    
+    return False
+
+
+# -----------------------
 # Topic loader - Fixed field mapping
 # -----------------------
 def load_topics(path: str) -> List[Dict]:
@@ -93,7 +127,7 @@ def validate_env(env: dict):
 # -----------------------
 def setup_model(model_hf_id: str, bnb_conf: dict, hf_token: str = None):
     """
-    Setup model with 8-bit quantization using modern HuggingFace practices.
+    Setup model with optimized configuration for high-end hardware.
 
     Args:
         model_hf_id: HuggingFace model identifier
@@ -103,7 +137,7 @@ def setup_model(model_hf_id: str, bnb_conf: dict, hf_token: str = None):
     Returns:
         tuple: (tokenizer, model)
     """
-    logger.info(f"Setting up model {model_hf_id} with 8-bit quantization.")
+    logger.info(f"Setting up model {model_hf_id} with optimized configuration for high-end hardware.")
 
     try:
         # Setup tokenizer with proper token handling
@@ -111,37 +145,41 @@ def setup_model(model_hf_id: str, bnb_conf: dict, hf_token: str = None):
             model_hf_id,
             use_fast=True,
             token=hf_token if hf_token else None,
-            trust_remote_code=True
+            trust_remote_code=True,
+            padding_side='left'  # Fix for decoder-only models
         )
 
         # Ensure tokenizer has pad token
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # Setup quantization config using BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=bnb_conf.get("load_in_8bit", True),
-            load_in_4bit=False,  # Explicitly disable 4-bit when using 8-bit
-        )
-
-        # Load model with proper configuration
+        # Optimize for high-end hardware with 700+ GB RAM and 2x A6000 GPUs
+        # Use bfloat16 for better performance and disable quantization for faster inference
         model = AutoModelForCausalLM.from_pretrained(
             model_hf_id,
-            device_map="auto",
-            quantization_config=quantization_config,
+            device_map="auto",  # Automatically distribute across 2 GPUs
             trust_remote_code=True,
             token=hf_token if hf_token else None,
-            torch_dtype=torch.float16,  # Use fp16 for better performance with quantization
+            torch_dtype=torch.bfloat16,  # Use bfloat16 for better performance on A6000
+            low_cpu_mem_usage=True,
+            # No quantization for maximum speed with your hardware
         )
 
         # Ensure model is in eval mode
         model.eval()
+        
+        # Enable model compilation for faster inference (if supported)
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            logger.info("Model compiled for optimized inference")
+        except Exception as e:
+            logger.warning(f"Model compilation failed, continuing without: {e}")
 
     except Exception as e:
         logger.exception(f"Failed to load model {model_hf_id}. Exception: {e}")
         raise
 
-    logger.info("Model loaded successfully.")
+    logger.info("Model loaded successfully with optimized configuration.")
     return tokenizer, model
 
 
@@ -162,6 +200,89 @@ SYSTEM_PROMPT_RW = (
 )
 
 USER_PROMPT_RW = "Original query: {QUERY}\nRewritten query:"
+
+
+# -----------------------
+# Batch processing for faster inference
+# -----------------------
+def rewrite_batch(tokenizer, model, queries: List[str], generation_conf: dict, batch_size: int = 8) -> List[str]:
+    """
+    Rewrite a batch of queries for faster processing.
+    
+    Args:
+        tokenizer: HuggingFace tokenizer
+        model: HuggingFace model
+        queries: List of original query texts
+        generation_conf: Generation configuration dictionary
+        batch_size: Number of queries to process in parallel
+        
+    Returns:
+        List[str]: List of rewritten queries
+    """
+    results = []
+    
+    for i in range(0, len(queries), batch_size):
+        batch_queries = queries[i:i+batch_size]
+        batch_prompts = [
+            f"{SYSTEM_PROMPT_RW}\n\n{USER_PROMPT_RW.format(QUERY=query)}"
+            for query in batch_queries
+        ]
+        
+        try:
+            # Tokenize batch with proper padding
+            inputs = tokenizer(
+                batch_prompts,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048
+            ).to(model.device)
+            
+            gen_kwargs = {
+                "max_new_tokens": generation_conf.get("max_new_tokens", 128),
+                "do_sample": generation_conf.get("do_sample", False),
+                "temperature": generation_conf.get("temperature", 0.0),
+                "top_p": generation_conf.get("top_p", 0.95),
+                "eos_token_id": tokenizer.eos_token_id,
+                "pad_token_id": tokenizer.pad_token_id,
+                "use_cache": True,
+            }
+            
+            # Add sampling parameters only if do_sample is True
+            if not gen_kwargs["do_sample"]:
+                gen_kwargs.pop("temperature")
+                gen_kwargs.pop("top_p")
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    **gen_kwargs
+                )
+            
+            # Decode batch results
+            batch_results = []
+            for j, output in enumerate(outputs):
+                # Decode only the generated part
+                input_len = len(inputs["input_ids"][j])
+                generated_tokens = output[input_len:]
+                rewritten = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                
+                # Clean up the output
+                rewritten = rewritten.strip()
+                if "\n" in rewritten:
+                    rewritten = rewritten.split("\n")[0].strip()
+                
+                batch_results.append(rewritten if rewritten else batch_queries[j])
+            
+            results.extend(batch_results)
+            
+        except Exception as e:
+            logger.error(f"Error in batch processing: {e}")
+            # Fallback to original queries for this batch
+            results.extend(batch_queries)
+    
+    return results
 
 
 # -----------------------
@@ -237,9 +358,9 @@ def rewrite_single(tokenizer, model, original_query: str, generation_conf: dict)
 def rewrite_topic_set(model_name: str, model_hf_id: str, bnb_conf: dict,
                       topic_file: str, output_dir: str, generation_conf: dict,
                       dataset_version: str, preview_count: int = 5,
-                      hf_token: str = None):
+                      hf_token: str = None, batch_size: int = 8):
     """
-    Rewrite all topics in a topic set using dynamic file naming.
+    Rewrite all topics in a topic set using dynamic file naming with batch processing.
 
     Args:
         model_name: Name of the model (for file naming)
@@ -251,10 +372,18 @@ def rewrite_topic_set(model_name: str, model_hf_id: str, bnb_conf: dict,
         dataset_version: Dataset version (train, dev-1, etc.)
         preview_count: Number of examples to preview
         hf_token: HuggingFace token
+        batch_size: Number of queries to process in parallel
 
     Returns:
         list: List of rewritten topics
     """
+    # Check if output already exists
+    if check_existing_output(model_name, dataset_version, output_dir):
+        logger.info(f"Output file already exists for {model_name} on {dataset_version}. Skipping...")
+        return []
+    
+    logger.info(f"Starting rewrite for {model_name} on {dataset_version}")
+    
     tokenizer, model = setup_model(
         model_hf_id=model_hf_id,
         bnb_conf=bnb_conf,
@@ -262,26 +391,25 @@ def rewrite_topic_set(model_name: str, model_hf_id: str, bnb_conf: dict,
     )
 
     topics = load_topics(topic_file)
-    results = []
     logger.info(
-        f"Beginning rewrite loop for {len(topics)} topics using model {model_name} "
-        f"on dataset {dataset_version}"
+        f"Beginning batch rewrite for {len(topics)} topics using model {model_name} "
+        f"on dataset {dataset_version} with batch size {batch_size}"
     )
 
-    for t in tqdm(topics, desc=f"Rewriting with {model_name}"):
-        qid = t["query_id"]
-        qtext = t["query"]
-        try:
-            rewritten = rewrite_single(
-                tokenizer, model, qtext, generation_conf)
-            if not rewritten:  # Fallback to original if rewrite fails
-                logger.warning(
-                    f"Empty rewrite for query_id {qid}, using original")
-                rewritten = qtext
-        except Exception as e:
-            logger.exception(f"Rewrite failed for query_id {qid}: {e}")
-            rewritten = qtext  # Fallback to original query
-
+    # Extract queries for batch processing
+    queries = [t["query"] for t in topics]
+    query_ids = [t["query_id"] for t in topics]
+    
+    # Process in batches with progress bar
+    rewritten_queries = []
+    for i in tqdm(range(0, len(queries), batch_size), desc=f"Batch rewriting with {model_name}"):
+        batch_queries = queries[i:i+batch_size]
+        batch_results = rewrite_batch(tokenizer, model, batch_queries, generation_conf, len(batch_queries))
+        rewritten_queries.extend(batch_results)
+    
+    # Combine results
+    results = []
+    for qid, rewritten in zip(query_ids, rewritten_queries):
         results.append({"query_id": qid, "query": rewritten})
 
     # Dynamic file naming: model_name_dataset_version_rewritten_queries.jsonl

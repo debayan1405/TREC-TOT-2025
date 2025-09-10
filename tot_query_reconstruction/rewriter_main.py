@@ -90,8 +90,24 @@ def main(env_path: str = None, models_to_run=None, datasets_to_run=None):
         print(f"Running rewriting for:")
         print(f"  Models: {models_to_run}")
         print(f"  Datasets: {datasets_to_run}")
+        print(f"  Hardware: Optimized for high-end GPUs (2x A6000) and 700+ GB RAM")
+
+        # Check existing files and show status
+        print(f"\n{'='*60}")
+        print("CHECKING EXISTING FILES")
+        print(f"{'='*60}")
+        
+        from rewriter import check_existing_output
+        for model_name in models_to_run:
+            for dataset_version in datasets_to_run:
+                exists = check_existing_output(model_name, dataset_version, paths["rewritten_queries_directory"])
+                status = "✓ EXISTS" if exists else "✗ MISSING"
+                print(f"  {model_name}_{dataset_version}: {status}")
 
         # Run rewriting for each model and dataset combination
+        total_combinations = len(models_to_run) * len(datasets_to_run)
+        completed_combinations = 0
+        
         for model_name in models_to_run:
             print(f"\n{'='*60}")
             print(f"Running rewrites for model: {model_name}")
@@ -102,8 +118,9 @@ def main(env_path: str = None, models_to_run=None, datasets_to_run=None):
             bnb_conf = model_cfg.get("bitsandbytes", {})
 
             for dataset_version in datasets_to_run:
+                completed_combinations += 1
                 print(f"\n{'-'*40}")
-                print(f"Dataset version: {dataset_version}")
+                print(f"Dataset version: {dataset_version} ({completed_combinations}/{total_combinations})")
                 print(f"{'-'*40}")
 
                 topic_path = version_map[dataset_version]
@@ -122,7 +139,8 @@ def main(env_path: str = None, models_to_run=None, datasets_to_run=None):
                         generation_conf=generation_conf,
                         dataset_version=dataset_version,
                         preview_count=preview_count,
-                        hf_token=hf_token
+                        hf_token=hf_token,
+                        batch_size=16  # Larger batch size for better GPU utilization
                     )
                     print(
                         f"✓ Successfully completed {model_name} on {dataset_version}")
