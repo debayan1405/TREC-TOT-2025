@@ -8,9 +8,57 @@ import pandas as pd
 import pyterrier as pt
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+import re
+
+from config_loader import ConfigLoader
 
 
-from .config_loader import ConfigLoader
+def clean_query_text(query: str) -> str:
+    """
+    Clean query text to avoid PyTerrier parser errors.
+    
+    Args:
+        query (str): Original query text
+        
+    Returns:
+        str: Cleaned query text
+    """
+    if not query:
+        return ""
+    
+    # Replace problematic characters for PyTerrier query parser
+    query = query.replace("/", " OR ")  # Replace slash with OR operator
+    query = query.replace("'", "")      # Remove single quotes
+    query = query.replace('"', "")      # Remove double quotes
+    query = query.replace("(", "")      # Remove parentheses
+    query = query.replace(")", "")
+    query = query.replace("[", "")      # Remove brackets
+    query = query.replace("]", "")
+    query = query.replace(":", " ")     # Replace colon with space
+    query = query.replace(";", " ")     # Replace semicolon with space
+    query = query.replace("!", "")      # Remove exclamation marks
+    query = query.replace("?", "")      # Remove question marks
+    query = query.replace("#", "")      # Remove hash
+    query = query.replace("@", "")      # Remove at symbol
+    query = query.replace("$", "")      # Remove dollar sign
+    query = query.replace("%", "")      # Remove percent
+    query = query.replace("^", "")      # Remove caret
+    query = query.replace("&", " AND ") # Replace ampersand with AND
+    query = query.replace("*", "")      # Remove asterisk
+    query = query.replace("+", " ")     # Replace plus with space
+    query = query.replace("=", " ")     # Replace equals with space
+    query = query.replace("|", " OR ")  # Replace pipe with OR
+    query = query.replace("\\", " ")    # Replace backslash with space
+    query = query.replace("<", "")      # Remove angle brackets
+    query = query.replace(">", "")
+    query = query.replace(".", " ")     # Replace periods with space
+    query = query.replace(",", " ")     # Replace commas with space
+    
+    # Clean up multiple spaces
+    query = re.sub(r'\s+', ' ', query)
+    
+    # Trim and return
+    return query.strip()
 
 class DataLoader:
     """Handles loading of topics, qrels, and index management."""
@@ -82,7 +130,7 @@ class DataLoader:
 
                     topics.append({
                         'qid': qid,
-                        'query': topic['query']
+                        'query': clean_query_text(topic['query'])
                     })
         except Exception as e:
             raise ValueError(f"Error loading topics from {topics_path}: {e}")
