@@ -7,7 +7,7 @@ import json
 import pandas as pd
 import pyterrier as pt
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from config_loader import ConfigLoader
 
 

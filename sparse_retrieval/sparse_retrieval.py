@@ -5,11 +5,39 @@ Updated with enhanced dynamic path creation and evaluation storage.
 """
 import os
 import pandas as pd
+
 import pyterrier as pt
+from pyterrier.transformer import Transformer
+
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from config_loader import ConfigLoader
 from data_loader import DataLoader
+
+import re
+
+
+class QuerySanitiser(Transformer):
+    """
+    A custom transformer that cleans a query string to make it safe for
+    the old Terrier v0.1.5 parser. It removes punctuation and returns a
+    single, space-separated string.
+    """
+
+    def transform(self, topics: pd.DataFrame) -> pd.DataFrame:
+        topics_c = topics.copy()
+
+        # This function cleans the query
+        def clean_query(query):
+            # Remove apostrophes and other problematic punctuation
+            # by keeping only letters, numbers, and spaces
+            text = re.sub(r'[^a-zA-Z0-9 ]', ' ', query)
+            # Normalize whitespace (e.g., convert multiple spaces to one)
+            return " ".join(text.split())
+
+        # Apply the cleaning function to the 'query' column
+        topics_c['query'] = topics_c['query'].apply(clean_query)
+        return topics_c
 
 
 class SparseRetrieval:
@@ -246,19 +274,17 @@ class SparseRetrieval:
 
     def _create_retriever(self, wmodel: str) -> Any:
         """
-        Create PyTerrier retriever for given weighting model.
-
-        Args:
-            wmodel (str): Weighting model name
-
-        Returns:
-            PyTerrier retriever object
+        Create a robust PyTerrier retrieval pipeline that tokenizes
+        queries before passing them to the backend.
         """
         if wmodel not in self.SUPPORTED_MODELS:
             raise ValueError(
                 f"Unsupported weighting model: {wmodel}. Supported models: {self.SUPPORTED_MODELS}")
 
-        return pt.terrier.Retriever(self.index, wmodel=wmodel)
+        retriever = pt.BatchRetrieve(self.index, wmodel=wmodel)
+
+        # Use the new QuerySanitiser class
+        return QuerySanitiser() >> retriever
 
     def run_retrieval(self, wmodel: str, topics: pd.DataFrame, query_source: str,
                       dataset_version: str, force_rerun: bool = False) -> pd.DataFrame:
@@ -295,7 +321,7 @@ class SparseRetrieval:
 
         # Run retrieval
         try:
-            results = retriever.transform(topics)
+            results = retriever.transform(topics, verbose = True)
 
             # Ensure required columns are present
             required_cols = ["qid", "docno", "score", "rank"]
@@ -411,7 +437,8 @@ class SparseRetrieval:
                 topics,
                 qrels,
                 eval_metrics=eval_metrics,
-                names=retriever_names
+                names=retriever_names,
+                verbose = True
             )
 
             # Save individual evaluation results for each model
