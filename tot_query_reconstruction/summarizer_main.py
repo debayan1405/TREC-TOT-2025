@@ -30,13 +30,14 @@ def find_env_path():
         "env.json not found in current directory, parent directory, or grandparent directory")
 
 
-def main(env_path: str = None, datasets_to_run: list = None):
+def main(env_path: str = None, datasets_to_run: list = None, batch_size: int = 8):
     """
-    Main function to run query summarization.
+    Main function to run query summarization with optimized hardware utilization.
 
     Args:
         env_path: Path to env.json file (auto-detected if None)
         datasets_to_run: List of dataset versions to summarize (all if None)
+        batch_size: Number of queries to process in parallel
     """
     try:
         # Auto-detect env.json path if not provided
@@ -60,6 +61,7 @@ def main(env_path: str = None, datasets_to_run: list = None):
                 f"Rewritten queries directory not found: {rewritten_dir}")
 
         print(f"Looking for rewritten query files in: {rewritten_dir}")
+        print(f"Hardware optimization: Using batch size {batch_size} for 2x A6000 GPUs and 700+ GB RAM")
 
         # List available rewritten query files
         rewritten_files = list(rewritten_dir.glob("*_rewritten_queries.jsonl"))
@@ -94,7 +96,7 @@ def main(env_path: str = None, datasets_to_run: list = None):
                 raise ValueError("No valid datasets to process")
 
         print(f"\n{'='*60}")
-        print("Starting query summarization")
+        print("Starting query summarization with optimized batch processing")
         print(f"{'='*60}")
 
         # Run summarization
@@ -102,7 +104,8 @@ def main(env_path: str = None, datasets_to_run: list = None):
             env=env,
             rewritten_dir=rewritten_dir,
             datasets_to_run=datasets_to_run,
-            hf_token=hf_token
+            hf_token=hf_token,
+            batch_size=batch_size
         )
 
         print(f"\n{'='*60}")
@@ -123,7 +126,7 @@ def main(env_path: str = None, datasets_to_run: list = None):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Summarize rewritten queries from multiple models"
+        description="Summarize rewritten queries from multiple models with optimized batch processing"
     )
     parser.add_argument(
         "--env",
@@ -136,6 +139,12 @@ if __name__ == "__main__":
         choices=["train", "dev-1", "dev-2", "dev-3", "test"],
         help="Subset of datasets to summarize. All available datasets if not specified."
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Number of queries to process in parallel (default: 8, optimized for high-end GPUs)"
+    )
 
     args = parser.parse_args()
-    main(args.env, args.datasets)
+    main(args.env, args.datasets, args.batch_size)
