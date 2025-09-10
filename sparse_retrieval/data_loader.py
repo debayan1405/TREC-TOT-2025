@@ -60,6 +60,7 @@ def clean_query_text(query: str) -> str:
     # Trim and return
     return query.strip()
 
+
 class DataLoader:
     """Handles loading of topics, qrels, and index management."""
 

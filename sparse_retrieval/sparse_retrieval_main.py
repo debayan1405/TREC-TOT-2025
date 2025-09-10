@@ -1,6 +1,6 @@
 """
 Main execution script for PyTerrier sparse retrieval experiments.
-Updated with hard-coded dataset control and enhanced path management.
+Updated to support multiple query sources, dynamic path management, and hardware optimizations.
 """
 import os
 import sys
@@ -9,10 +9,6 @@ from pathlib import Path
 # Fix Java environment before importing PyTerrier
 def setup_java_environment():
     """Set up Java environment for PyTerrier."""
-    
-    # Skip if already set up
-    if os.environ.get('JAVA_HOME') and '/anaconda3/' in os.environ.get('JAVA_HOME', ''):
-        return os.environ.get('JAVA_HOME')
     
     # Find the correct Java installation
     possible_java_paths = [
@@ -48,6 +44,7 @@ setup_java_environment()
 import pyterrier as pt
 import pandas as pd
 import argparse
+import time
 from config_loader import ConfigLoader
 from data_loader import DataLoader
 from sparse_retrieval import SparseRetrieval
@@ -62,7 +59,8 @@ from sparse_retrieval import SparseRetrieval
 DATASET_VERSION = "train"  # <-- CHANGE THIS LINE TO USE DIFFERENT DATASETS
 
 # Query sources to test (None means auto-detect all available sources)
-QUERY_SOURCES = ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
+QUERY_SOURCES = ["rewritten_llama"]
+# QUERY_SOURCES = ["original", "rewritten_llama", "rewritten_mistral", "rewritten_qwen", "summarized"]
 
 # Models to run (None means all supported models)
 # Options: ["BM25", "PL2", "TF_IDF"]
@@ -114,15 +112,16 @@ def main(env_path: str = None, override_dataset: str = None,
         override_force_rerun: Override hard-coded force rerun setting
     """
     try:
-        # Initialize PyTerrier with better configuration
+        # Initialize PyTerrier with optimized settings
         if not hasattr(pt, 'java') or not pt.java.started():
             print("🔧 Initializing PyTerrier with optimized settings...")
-            pt.init(mem=8192, logging="WARN")  # Use integer for memory in MB
+            pt.init(mem=8192, logging="WARN")  # 8GB memory allocation
             print("✓ PyTerrier initialized successfully")
         else:
             print("✓ PyTerrier already initialized")
 
-        print("=== PyTerrier Sparse Retrieval Experiment ===\n")
+        print("=== PyTerrier Sparse Retrieval Experiment ===")
+        print("🚀 Optimized for high-end hardware (700+ GB RAM, 2x A6000 GPUs)")
 
         # Auto-detect env.json path if not provided
         if env_path is None:
