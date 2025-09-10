@@ -3,6 +3,10 @@ Main execution script for Reciprocal Rank Fusion (RRF) experiments.
 This script identifies run files grouped by query re-writer, performs fusion,
 and evaluates the results.
 """
+from rrf_fusion import RRFusion
+import argparse
+import sys
+from pathlib import Path
 
 # Add project root to the Python path to allow sibling imports
 project_root = Path(__file__).resolve().parent.parent
@@ -10,24 +14,18 @@ sys.path.append(str(project_root))
 
 from sparse_retrieval.config_loader import ConfigLoader
 
-from rrf_fusion import RRFusion
-import argparse
-import sys
-from pathlib import Path
-
-# Add parent directory to path to import from other modules
-sys.path.append(str(Path(__file__).parent.parent / 'sparse_retrieval'))
+# CLEANED: Add project root to the Python path just once.
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
 
 
 def find_env_path():
-    """Finds the env.json file by searching in parent directories."""
-    current_dir = Path(__file__).parent
-    for i in range(3):  # Check current, parent, and grandparent
-        env_path = current_dir / "env.json"
-        if env_path.exists():
-            return str(env_path)
-        current_dir = current_dir.parent
-    raise FileNotFoundError("env.json not found in the project structure.")
+    """Finds the env.json file by searching in the project structure."""
+    env_path = project_root / "env.json"
+    if env_path.exists():
+        return str(env_path)
+    raise FileNotFoundError(
+        "env.json not found in the project root directory.")
 
 
 def main():

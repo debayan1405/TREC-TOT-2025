@@ -194,9 +194,9 @@ class ConfigLoader:
         """Get sparse run directory path."""
         return self.config["paths"]["sparse_run_directory"]
 
-    def get_combined_run_directory(self) -> str:
-        """Get combined run directory path."""
-        return self.config["paths"]["combined_run_directory"]
+    def get_fusion_run_directory(self) -> str:
+        """Get fusion run directory path."""
+        return self.config["paths"]["fusion_run_directory"]
 
     def get_evaluation_directory(self) -> str:
         """Get evaluation directory path."""

@@ -8,8 +8,9 @@ import pandas as pd
 import pyterrier as pt
 from pathlib import Path
 from typing import Dict, Any, Optional, List
-from config_loader import ConfigLoader
 
+
+from .config_loader import ConfigLoader
 
 class DataLoader:
     """Handles loading of topics, qrels, and index management."""

@@ -4,11 +4,6 @@ This module groups run files by query re-writer, performs RRF for each group,
 and evaluates the fused results.
 """
 
-# Add project root to the Python path to allow sibling imports
-project_root = Path(__file__).resolve().parent.parent
-sys.path.append(str(project_root))
-
-from sparse_retrieval.config_loader import ConfigLoader
 
 import pandas as pd
 import pyterrier as pt
@@ -16,8 +11,16 @@ from collections import defaultdict
 from pathlib import Path
 import sys
 
-# Add parent directory to path to import ConfigLoader
-sys.path.append(str(Path(__file__).parent.parent / 'sparse_retrieval'))
+# Add project root to the Python path to allow sibling imports
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
+
+from sparse_retrieval.data_loader import DataLoader
+from sparse_retrieval.config_loader import ConfigLoader
+
+# Add project root to the Python path to allow sibling imports
+project_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(project_root))
 
 
 class RRFusion:
@@ -34,6 +37,7 @@ class RRFusion:
             dataset_version (str): The dataset to process (e.g., "train", "dev-1").
         """
         self.config = config
+        self.data_loader = DataLoader(config)  # Initialize DataLoader
         self.dataset_version = dataset_version
         self.rrf_k = self.config.get_rrf_k()
 
@@ -52,13 +56,13 @@ class RRFusion:
 
     def _reciprocal_rank_fusion(self, list_of_run_files: list) -> dict:
         """
-        Performs Reciprocal Rank Fusion on a list of run files.
+        Performs Reciprocal Rank Fusion on a list of run files, preserving query IDs.
 
         Args:
             list_of_run_files (list): A list of paths to run files.
 
         Returns:
-            dict: A dictionary of {doc_id: score} for a single query.
+            dict: A dictionary of {(qid, doc_id): score}.
         """
         fused_scores = defaultdict(float)
 
@@ -72,7 +76,8 @@ class RRFusion:
             )
 
             for _, row in df.iterrows():
-                fused_scores[row['docno']] += 1.0 / (self.rrf_k + row['rank'])
+                fused_scores[(row['qid'], row['docno'])] += 1.0 / \
+                    (self.rrf_k + row['rank'])
 
         return fused_scores
 
@@ -88,7 +93,6 @@ class RRFusion:
         rewriter_groups = defaultdict(list)
 
         for run_file in all_run_files:
-            # Filename format: {rewriter}_{dataset}_{model}_{k}.txt
             rewriter_name = run_file.name.split('_')[0]
             rewriter_groups[rewriter_name].append(str(run_file))
 
@@ -106,62 +110,73 @@ class RRFusion:
             print(f"No run files found in {self.sparse_run_dir}. Aborting.")
             return
 
-        # Load Qrels once for the dataset
-        can_evaluate = False
+        # Load Qrels and Topics for the dataset
         qrels = None
+        topics = None
+        can_evaluate = False
         try:
-            qrels_path = self.config.get_qrels_path(self.dataset_version)
-            qrels = pt.io.read_qrels(qrels_path)
+            qrels = self.data_loader.load_qrels(self.dataset_version)
+            # We load 'original' topics as the baseline for qids
+            topics = self.data_loader.load_topics(
+                self.dataset_version, "original")
             can_evaluate = True
             print(
-                f"Successfully loaded qrels for '{self.dataset_version}' from {qrels_path}")
+                f"Successfully loaded qrels and topics for '{self.dataset_version}'")
         except Exception as e:
             print(
-                f"Warning: Could not load qrels for '{self.dataset_version}'. Skipping evaluation. Error: {e}")
+                f"Warning: Could not load qrels/topics. Skipping evaluation. Error: {e}")
 
         # Process each re-writer group
         for rewriter, run_files in rewriter_groups.items():
             print(f"\n--- Processing re-writer: {rewriter} ---")
             print(f"Fusing {len(run_files)} run files...")
 
-            # Step 1: Perform Fusion
             fused_scores = self._reciprocal_rank_fusion(run_files)
+            if not fused_scores:
+                print(
+                    f"Warning: Fusion for '{rewriter}' resulted in no scores. Skipping.")
+                continue
 
-            # Step 2: Format and save the fused results
-            sorted_docs = sorted(fused_scores.items(),
-                                 key=lambda item: item[1], reverse=True)
+            data = [{'qid': qid, 'docno': docno, 'score': score}
+                    for (qid, docno), score in fused_scores.items()]
+            fused_df = pd.DataFrame(data)
+
+            fused_df['rank'] = fused_df.groupby('qid')['score'].rank(
+                method='first', ascending=False).astype(int)
+            fused_df = fused_df.sort_values(['qid', 'rank'])
 
             output_path = self.fusion_run_dir / \
                 f"{rewriter}_{self.dataset_version}_fused.txt"
 
-            # Assuming a single query ID '1' for all docs in the fusion.
-            # This is a common practice for saving fused lists if qid is not tracked.
             with open(output_path, 'w') as f_out:
-                for i, (doc_id, score) in enumerate(sorted_docs):
-                    rank = i + 1
+                for _, row in fused_df.iterrows():
                     f_out.write(
-                        f"1 Q0 {doc_id} {rank} {score:.6f} {rewriter}_fused\n")
+                        f"{row['qid']} Q0 {row['docno']} {row['rank']} {row['score']:.6f} {rewriter}_fused\n")
 
             print(f"Saved fused run file for '{rewriter}' to: {output_path}")
 
-            # Step 3: Run evaluation
-            if can_evaluate and qrels is not None:
+            # Run evaluation
+            if can_evaluate and qrels is not None and topics is not None:
                 try:
-                    results_df = pt.io.read_results(str(output_path))
-                    eval_metrics = self.config.get_eval_metrics()
+                    eval_df = pt.Experiment(
+                        [fused_df],
+                        topics,
+                        qrels,
+                        eval_metrics=self.config.get_eval_metrics(),
+                        names=[rewriter]
+                    )
 
-                    eval_results = pt.Utils.evaluate(
-                        results_df, qrels, metrics=eval_metrics)
-
-                    eval_df = pd.DataFrame([eval_results])
-                    eval_df.index = [rewriter]
-
-                    eval_path = self.eval_dir / \
-                        f"{rewriter}_{self.dataset_version}_eval.csv"
-                    eval_df.to_csv(eval_path)
-                    print(f"Saved evaluation for '{rewriter}' to: {eval_path}")
-                    print("Evaluation Results:")
-                    print(eval_df.to_string())
+                    if eval_df is not None and not eval_df.empty:
+                        eval_path = self.eval_dir / \
+                            f"{rewriter}_{self.dataset_version}_eval.csv"
+                        eval_df.to_csv(eval_path)
+                        print(
+                            f"Saved evaluation for '{rewriter}' to: {eval_path}")
+                        print("Evaluation Results:")
+                        print(eval_df.to_string())
+                    else:
+                        print(
+                            f"Warning: Evaluation for '{rewriter}' produced no results.")
 
                 except Exception as e:
                     print(f"Error during evaluation for '{rewriter}': {e}")
