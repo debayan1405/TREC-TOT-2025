@@ -3,8 +3,10 @@ TREC-TOT 2025 Submission Description Template
 
 ## System Overview
 
-**Team:** [Your Team Name]
+**Team:** IRIS
+
 **Run Name:** TREC_TOT_2025_llama_test_final_submission
+
 **Approach:** Multi-Stage Hierarchical Retrieval and Reranking Pipeline
 
 ## Pipeline Description
