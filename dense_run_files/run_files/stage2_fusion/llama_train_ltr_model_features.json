@@ -1,0 +1,14 @@
+[
+  "all-mpnet-base-v2_score",
+  "multi-qa-mpnet-base-dot-v1_score",
+  "all-MiniLM-L6-v2_score",
+  "msmarco-distilbert-base-v4_score",
+  "all-mpnet-base-v2_rank",
+  "multi-qa-mpnet-base-dot-v1_rank",
+  "all-MiniLM-L6-v2_rank",
+  "msmarco-distilbert-base-v4_rank",
+  "all-mpnet-base-v2_norm_score",
+  "multi-qa-mpnet-base-dot-v1_norm_score",
+  "all-MiniLM-L6-v2_norm_score",
+  "msmarco-distilbert-base-v4_norm_score"
+]
