@@ -1,0 +1,31 @@
+{
+  "dataset": "train",
+  "timestamp": "2025-09-10 18:36:45",
+  "cross_encoder": {
+    "summarized": {
+      "input_file": "../fused_run_files/train/summarized_train_fused.txt",
+      "output_file": "../dense_run_files/train/summarized_train_dense_cross-encoder.txt",
+      "results_count": 14300,
+      "processing_time": 16.865952968597412
+    },
+    "mistral": {
+      "input_file": "../fused_run_files/train/mistral_train_fused.txt",
+      "output_file": "../dense_run_files/train/mistral_train_dense_cross-encoder.txt",
+      "results_count": 14300,
+      "processing_time": 16.1843044757843
+    },
+    "qwen": {
+      "input_file": "../fused_run_files/train/qwen_train_fused.txt",
+      "output_file": "../dense_run_files/train/qwen_train_dense_cross-encoder.txt",
+      "results_count": 14300,
+      "processing_time": 16.483579874038696
+    },
+    "llama": {
+      "input_file": "../fused_run_files/train/llama_train_fused.txt",
+      "output_file": "../dense_run_files/train/llama_train_dense_cross-encoder.txt",
+      "results_count": 14300,
+      "processing_time": 16.238178968429565
+    }
+  },
+  "bi_encoder": {}
+}

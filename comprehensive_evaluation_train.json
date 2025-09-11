@@ -1,0 +1,164 @@
+{
+  "dataset": "train",
+  "timestamp": "2025-09-10 18:43:36",
+  "file_inventory": {
+    "sparse": {
+      "qwen_5000": "sparse_run_files/train/qwen_train_tf_idf_5000.txt",
+      "mistral_5000": "sparse_run_files/train/mistral_train_pl2_5000.txt",
+      "summarized_5000": "sparse_run_files/train/summarized_train_bm25_5000.txt",
+      "llama_5000": "sparse_run_files/train/llama_train_tf_idf_5000.txt"
+    },
+    "fusion": {
+      "summarized": "fused_run_files/train/summarized_train_fused.txt",
+      "mistral": "fused_run_files/train/mistral_train_fused.txt",
+      "qwen": "fused_run_files/train/qwen_train_fused.txt",
+      "llama": "fused_run_files/train/llama_train_fused.txt"
+    },
+    "dense_cross": {
+      "mistral": "dense_run_files/train/mistral_train_dense_cross-encoder.txt",
+      "llama": "dense_run_files/train/llama_train_dense_cross-encoder.txt",
+      "qwen": "dense_run_files/train/qwen_train_dense_cross-encoder.txt",
+      "summarized": "dense_run_files/train/summarized_train_dense_cross-encoder.txt"
+    }
+  },
+  "evaluation_results": {
+    "sparse": {
+      "qwen_5000": {
+        "ndcg_cut_10": 0.08422134237311638,
+        "recall_1000": 0.4405594405594406,
+        "P_10": 0.01118881118881119
+      },
+      "mistral_5000": {
+        "ndcg_cut_10": 0.06637899981801845,
+        "recall_1000": 0.5104895104895105,
+        "P_10": 0.009790209790209791
+      },
+      "summarized_5000": {
+        "ndcg_cut_10": 0.07970337744513453,
+        "recall_1000": 0.5034965034965035,
+        "P_10": 0.011888111888111891
+      },
+      "llama_5000": {
+        "ndcg_cut_10": 0.07934301427918372,
+        "recall_1000": 0.42657342657342656,
+        "P_10": 0.01118881118881119
+      }
+    },
+    "fusion": {
+      "summarized": {
+        "ndcg_cut_10": 0.0699601644519199,
+        "recall_1000": 0.5034965034965035,
+        "P_10": 0.010489510489510492
+      },
+      "mistral": {
+        "ndcg_cut_10": 0.08120897048961506,
+        "recall_1000": 0.5384615384615384,
+        "P_10": 0.01258741258741259
+      },
+      "qwen": {
+        "ndcg_cut_10": 0.08235473846151514,
+        "recall_1000": 0.44755244755244755,
+        "P_10": 0.011888111888111891
+      },
+      "llama": {
+        "ndcg_cut_10": 0.07332131867984928,
+        "recall_1000": 0.4195804195804196,
+        "P_10": 0.010489510489510492
+      }
+    },
+    "dense_cross": {
+      "mistral": {
+        "ndcg_cut_10": 0.004911312475666226,
+        "recall_1000": 0.27972027972027974,
+        "P_10": 0.0013986013986013986
+      },
+      "llama": {
+        "ndcg_cut_10": 0.006903055529227131,
+        "recall_1000": 0.22377622377622378,
+        "P_10": 0.0013986013986013986
+      },
+      "qwen": {
+        "ndcg_cut_10": 0.006517201043604467,
+        "recall_1000": 0.21678321678321677,
+        "P_10": 0.0020979020979020983
+      },
+      "summarized": {
+        "ndcg_cut_10": 0.012504663890513712,
+        "recall_1000": 0.26573426573426573,
+        "P_10": 0.002797202797202797
+      }
+    }
+  },
+  "comparison_table": {
+    "Approach": {
+      "3": "sparse",
+      "1": "sparse",
+      "0": "sparse",
+      "2": "sparse",
+      "7": "fusion",
+      "5": "fusion",
+      "6": "fusion",
+      "4": "fusion",
+      "9": "dense_cross",
+      "8": "dense_cross",
+      "10": "dense_cross",
+      "11": "dense_cross"
+    },
+    "Configuration": {
+      "3": "llama_5000",
+      "1": "mistral_5000",
+      "0": "qwen_5000",
+      "2": "summarized_5000",
+      "7": "llama",
+      "5": "mistral",
+      "6": "qwen",
+      "4": "summarized",
+      "9": "llama",
+      "8": "mistral",
+      "10": "qwen",
+      "11": "summarized"
+    },
+    "ndcg_cut_10": {
+      "3": "0.0793",
+      "1": "0.0664",
+      "0": "0.0842",
+      "2": "0.0797",
+      "7": "0.0733",
+      "5": "0.0812",
+      "6": "0.0824",
+      "4": "0.0700",
+      "9": "0.0069",
+      "8": "0.0049",
+      "10": "0.0065",
+      "11": "0.0125"
+    },
+    "recall_1000": {
+      "3": "0.4266",
+      "1": "0.5105",
+      "0": "0.4406",
+      "2": "0.5035",
+      "7": "0.4196",
+      "5": "0.5385",
+      "6": "0.4476",
+      "4": "0.5035",
+      "9": "0.2238",
+      "8": "0.2797",
+      "10": "0.2168",
+      "11": "0.2657"
+    },
+    "P_10": {
+      "3": "0.0112",
+      "1": "0.0098",
+      "0": "0.0112",
+      "2": "0.0119",
+      "7": "0.0105",
+      "5": "0.0126",
+      "6": "0.0119",
+      "4": "0.0105",
+      "9": "0.0014",
+      "8": "0.0014",
+      "10": "0.0021",
+      "11": "0.0028"
+    }
+  }
+}

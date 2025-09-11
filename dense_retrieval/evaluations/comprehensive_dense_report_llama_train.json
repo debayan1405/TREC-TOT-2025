@@ -1,0 +1,48 @@
+{
+  "dataset": "train",
+  "rewriter": "llama",
+  "timestamp": 1757552286.2340522,
+  "stages": {
+    "stage1_bi_encoders": [
+      {
+        "stage": "stage1_bi_encoders",
+        "model": "all-mpnet-base-v2",
+        "output_file": "../dense_run_files/run_files/stage1_bi_encoders/llama_train_all-mpnet-base-v2.txt",
+        "num_results": 715,
+        "time_seconds": 5.185463905334473,
+        "metrics": null
+      },
+      {
+        "stage": "stage1_bi_encoders",
+        "model": "multi-qa-mpnet-base-dot-v1",
+        "output_file": "../dense_run_files/run_files/stage1_bi_encoders/llama_train_multi-qa-mpnet-base-dot-v1.txt",
+        "num_results": 715,
+        "time_seconds": 4.925307035446167,
+        "metrics": null
+      },
+      {
+        "stage": "stage1_bi_encoders",
+        "model": "all-MiniLM-L6-v2",
+        "output_file": "../dense_run_files/run_files/stage1_bi_encoders/llama_train_all-MiniLM-L6-v2.txt",
+        "num_results": 715,
+        "time_seconds": 3.992565870285034,
+        "metrics": null
+      },
+      {
+        "stage": "stage1_bi_encoders",
+        "model": "msmarco-distilbert-base-v4",
+        "output_file": "../dense_run_files/run_files/stage1_bi_encoders/llama_train_msmarco-distilbert-base-v4.txt",
+        "num_results": 715,
+        "time_seconds": 3.758387804031372,
+        "metrics": null
+      }
+    ],
+    "stage2_late_interaction": [],
+    "stage3_cross_encoders": [],
+    "stage4_llm_rankers": []
+  },
+  "summary": {
+    "total_models": 4,
+    "total_time": 17.861724615097046
+  }
+}
