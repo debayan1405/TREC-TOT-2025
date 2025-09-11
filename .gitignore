@@ -217,3 +217,5 @@ node_modules/
 
 trec-tot-2025-pyterrier-index*
 rewritten_queries_backup/
+
+*.gz
