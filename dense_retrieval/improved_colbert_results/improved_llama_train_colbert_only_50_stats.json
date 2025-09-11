@@ -1,0 +1,12 @@
+{
+  "total_queries": 143,
+  "processed_queries": 143,
+  "failed_queries": 0,
+  "successful_documents": 7150,
+  "failed_documents": 0,
+  "total_results": 7150,
+  "avg_docs_per_query": 50.0,
+  "scoring_method": "colbert_only",
+  "normalization": "none",
+  "max_docs_per_query": 50
+}

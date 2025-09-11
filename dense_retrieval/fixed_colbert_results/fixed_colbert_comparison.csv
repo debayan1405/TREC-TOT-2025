@@ -1,0 +1,4 @@
+System,MAP,MRR,NDCG@10
+LTR Fusion,0.4336,0.4336,0.4336
+Fixed ColBERT,0.0453,0.0453,0.0501
+Improvement,-89.56%,-89.56%,-88.44%
