@@ -540,15 +540,23 @@ class OptimizedBiEncoderRetriever(OptimizedBaseDenseRetriever):
 
 
 def create_optimized_bi_encoder_retrievers(config: Dict, dataset_version: str, 
-                                         rewriter: str, stage: str) -> List[OptimizedBiEncoderRetriever]:
+                                         rewriter: str, stage: str, models_filter: List[str] = None) -> List[OptimizedBiEncoderRetriever]:
     """Create optimized bi-encoder retrievers"""
     
-    models = [
+    all_models = [
         'all-mpnet-base-v2',
         'multi-qa-mpnet-base-dot-v1', 
         'all-MiniLM-L6-v2',
         'msmarco-distilbert-base-v4'
     ]
+    
+    # Filter models if specified
+    if models_filter:
+        models = [m for m in all_models if m in models_filter]
+        print(f"🎯 Running specific models: {models}")
+    else:
+        models = all_models
+        print(f"🎯 Running all models: {models}")
     
     # Create high-performance config
     perf_config = PerformanceConfig(

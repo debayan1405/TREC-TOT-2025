@@ -23,15 +23,28 @@ sys.path.append('/home/ugdf8/anaconda3/envs/pyterrier/lib/python3.11/site-packag
 import pyterrier as pt
 
 class ImprovedColBERTReranker:
-    def __init__(self, index_path: str, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, index_path: str, model_name: str = "all-MiniLM-L6-v2", 
+                 use_gpu: bool = True, batch_size: int = 32, progress_logging: bool = False):
         """Initialize the improved ColBERT reranker."""
         if not pt.started():
             pt.init()
         
         self.index = pt.IndexFactory.of(index_path)
         self.metaindex = self.index.getMetaIndex()
-        self.model = SentenceTransformer(model_name)
-        print(f"✅ Initialized ColBERT reranker with {model_name}")
+        self.batch_size = batch_size
+        self.progress_logging = progress_logging
+        self.use_gpu = use_gpu
+        
+        # Set device
+        self.device = torch.device('cuda' if use_gpu and torch.cuda.is_available() else 'cpu')
+        
+        # Initialize SentenceTransformer with device
+        self.model = SentenceTransformer(model_name, device=self.device)
+        print(f"✅ Initialized ColBERT reranker with {model_name} on {self.device}")
+        
+        if use_gpu and torch.cuda.is_available():
+            print(f"🚀 GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
+            print(f"📦 Batch size: {batch_size}")
     
     def get_document_text(self, docid: str) -> Optional[str]:
         """Retrieve document text by document ID."""
@@ -211,7 +224,7 @@ class ImprovedColBERTReranker:
 
 def main():
     parser = argparse.ArgumentParser(description="Improved ColBERT Reranker")
-    parser.add_argument("--dataset", choices=["train", "dev1", "dev2", "dev3"], 
+    parser.add_argument("--dataset", choices=["train", "dev1", "dev2", "dev3", "test"], 
                        default="train", help="Dataset to process")
     parser.add_argument("--rewriter", choices=["llama", "chatgpt"], 
                        default="llama", help="Query rewriter used")
@@ -223,12 +236,32 @@ def main():
                        default="minmax", help="Score normalization method")
     parser.add_argument("--index-path", default="../trec-tot-2025-pyterrier-index",
                        help="Path to PyTerrier index")
+    parser.add_argument("--gpu-acceleration", action="store_true",
+                       help="Enable GPU acceleration")
+    parser.add_argument("--batch-size", type=int, default=64,
+                       help="Batch size for GPU processing")
+    parser.add_argument("--progress-logging", action="store_true",
+                       help="Enable detailed progress logging")
     
     args = parser.parse_args()
     
     # File paths
     queries_file = f"../rewritten_queries/{args.rewriter}_{args.dataset}_rewritten_queries.jsonl"
+    
+    # Check for available fusion files (prefer LTR, fallback to RRF)
     ltr_file = f"../dense_run_files/run_files/stage2_fusion/{args.rewriter}_{args.dataset}_ltr_fusion.txt"
+    rrf_file = f"../dense_run_files/run_files/stage2_fusion/{args.rewriter}_{args.dataset}_rrf_fusion.txt"
+    
+    fusion_file = None
+    fusion_type = None
+    if os.path.exists(ltr_file):
+        fusion_file = ltr_file
+        fusion_type = "LTR"
+    elif os.path.exists(rrf_file):
+        fusion_file = rrf_file
+        fusion_type = "RRF"
+    else:
+        raise FileNotFoundError(f"Neither LTR fusion file ({ltr_file}) nor RRF fusion file ({rrf_file}) found")
     
     # Output directory and file
     output_dir = f"improved_colbert_results"
@@ -237,13 +270,18 @@ def main():
     
     print(f"🚀 Starting Improved ColBERT Reranking")
     print(f"📂 Queries: {queries_file}")
-    print(f"📂 LTR Results: {ltr_file}")
+    print(f"📂 {fusion_type} Results: {fusion_file}")
     print(f"📂 Output: {output_file}")
     
     # Initialize reranker and process
-    reranker = ImprovedColBERTReranker(args.index_path)
+    reranker = ImprovedColBERTReranker(
+        args.index_path,
+        use_gpu=args.gpu_acceleration,
+        batch_size=args.batch_size,
+        progress_logging=args.progress_logging
+    )
     reranker.process_queries(
-        queries_file, ltr_file, output_file,
+        queries_file, fusion_file, output_file,
         args.top_k, args.method, args.normalization
     )
     

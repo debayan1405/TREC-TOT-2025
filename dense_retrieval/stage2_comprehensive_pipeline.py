@@ -137,17 +137,19 @@ class ReciprocalRankFusion:
 class LearningToRankFusion:
     """Learning to Rank fusion using LightGBM"""
     
-    def __init__(self, qrel_file: str):
+    def __init__(self, qrel_file: str, use_gpu: bool = False, progress_logging: bool = False):
         self.qrel_file = qrel_file
         self.qrels = self._load_qrels()
         self.model = None
         self.feature_names = []
+        self.use_gpu = use_gpu
+        self.progress_logging = progress_logging
     
     def _load_qrels(self) -> Dict:
         """Load QREL file for training"""
         qrels = defaultdict(dict)
         
-        if os.path.exists(self.qrel_file):
+        if self.qrel_file and os.path.exists(self.qrel_file):
             with open(self.qrel_file, 'r') as f:
                 for line in f:
                     parts = line.strip().split()
@@ -258,7 +260,9 @@ class LearningToRankFusion:
             'bagging_fraction': 0.8,
             'bagging_freq': 5,
             'verbose': 0,
-            'device': 'cpu',  # Use CPU instead of GPU
+            'device': 'gpu' if hasattr(self, 'use_gpu') and self.use_gpu else 'cpu',
+            'gpu_platform_id': 0,
+            'gpu_device_id': 0,
             'num_threads': 16  # Use multiple CPU threads
         }
         
@@ -552,8 +556,18 @@ def main():
                        help='RRF parameter k')
     parser.add_argument('--skip-ltr', action='store_true', 
                        help='Skip LTR training (use existing model)')
+    parser.add_argument('--use-pretrained-ltr', action='store_true',
+                       help='Use pre-trained LTR model instead of training')
+    parser.add_argument('--ltr-model-path', type=str,
+                       help='Path to pre-trained LTR model file')
     parser.add_argument('--skip-colbert', action='store_true', 
                        help='Skip ColBERT reranking')
+    parser.add_argument('--gpu-acceleration', action='store_true',
+                       help='Enable GPU acceleration for computations')
+    parser.add_argument('--progress-logging', action='store_true',
+                       help='Enable detailed progress logging')
+    parser.add_argument('--batch-size', type=int, default=32,
+                       help='Batch size for GPU processing')
     
     args = parser.parse_args()
     
@@ -619,26 +633,58 @@ def main():
     
     # 2. LTR Fusion (if not skipped)
     ltr_results = None
-    if not args.skip_ltr and os.path.exists(args.qrel_file):
-        logger.info("🧠 Training LTR fusion model...")
-        ltr = LearningToRankFusion(args.qrel_file)
-        
-        try:
-            ltr.train_model(stage1_results)
-            ltr_results = ltr.predict_and_fuse(stage1_results)
+    if not args.skip_ltr:
+        if args.use_pretrained_ltr and args.ltr_model_path:
+            # Use pre-trained LTR model
+            logger.info(f"🤖 Loading pre-trained LTR model from {args.ltr_model_path}")
+            # For pre-trained models, we don't need QREL files
+            ltr = LearningToRankFusion(
+                None,  # No QRELs needed for inference
+                use_gpu=args.gpu_acceleration,
+                progress_logging=args.progress_logging
+            )
             
-            # Save LTR results
-            ltr_output = f"{args.output_dir}/{args.rewriter}_{args.dataset}_ltr_fusion.txt"
-            rrf.save_fused_results(ltr_results, ltr_output, "LTR_fusion")
-            logger.info(f"💾 LTR results saved to {ltr_output}")
+            try:
+                ltr.load_model(args.ltr_model_path)
+                ltr_results = ltr.predict_and_fuse(stage1_results)
+                
+                # Save LTR results
+                ltr_output = f"{args.output_dir}/{args.rewriter}_{args.dataset}_ltr_fusion.txt"
+                rrf.save_fused_results(ltr_results, ltr_output, "LTR_fusion")
+                logger.info(f"💾 LTR results saved to {ltr_output}")
+                
+            except Exception as e:
+                logger.error(f"Pre-trained LTR model loading failed: {e}")
+                logger.info("Falling back to RRF fusion only")
+                
+        elif os.path.exists(args.qrel_file):
+            # Train new LTR model
+            logger.info("🧠 Training LTR fusion model...")
+            ltr = LearningToRankFusion(
+                args.qrel_file,
+                use_gpu=args.gpu_acceleration,
+                progress_logging=args.progress_logging
+            )
             
-            # Save LTR model
-            model_output = f"{args.output_dir}/{args.rewriter}_{args.dataset}_ltr_model.txt"
-            ltr.save_model(model_output)
-            logger.info(f"🎯 LTR model saved to {model_output}")
-            
-        except Exception as e:
-            logger.error(f"LTR training failed: {e}")
+            try:
+                ltr.train_model(stage1_results)
+                ltr_results = ltr.predict_and_fuse(stage1_results)
+                
+                # Save LTR results
+                ltr_output = f"{args.output_dir}/{args.rewriter}_{args.dataset}_ltr_fusion.txt"
+                rrf.save_fused_results(ltr_results, ltr_output, "LTR_fusion")
+                logger.info(f"💾 LTR results saved to {ltr_output}")
+                
+                # Save LTR model
+                model_output = f"{args.output_dir}/{args.rewriter}_{args.dataset}_ltr_model.txt"
+                ltr.save_model(model_output)
+                logger.info(f"🎯 LTR model saved to {model_output}")
+                
+            except Exception as e:
+                logger.error(f"LTR training failed: {e}")
+                args.skip_ltr = True
+        else:
+            logger.warning("⚠️  No QREL file available and no pre-trained model specified. Skipping LTR.")
             args.skip_ltr = True
     
     # 3. Evaluation comparison

@@ -10,6 +10,7 @@ Maximum performance implementation with:
 - Adaptive batching
 - Mixed precision (FP16)
 - Multi-GPU support
+- Real-time progress monitoring
 """
 
 import os
@@ -20,6 +21,10 @@ import torch
 import psutil
 from typing import Dict, List
 import gc
+import threading
+
+# Global progress monitoring
+PROGRESS_INTERVAL = 10  # seconds
 
 # Add parent directories to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -124,8 +129,47 @@ def force_pyterrier_memory_optimization(index_path: str):
         print(f"   ⚠️  Properties file not found: {properties_file}")
 
 
+def start_progress_monitor():
+    """Start a background thread for progress monitoring"""
+    def monitor():
+        while True:
+            time.sleep(PROGRESS_INTERVAL)
+            print("\n📊 PROGRESS UPDATE:")
+            print_hardware_status()
+            print("🔄 Processing continues...\n")
+    
+    monitor_thread = threading.Thread(target=monitor, daemon=True)
+    monitor_thread.start()
+    return monitor_thread
+
+
+def distribute_models_to_gpus(retrievers: List) -> Dict:
+    """Distribute models across available GPUs for parallel processing"""
+    if not torch.cuda.is_available():
+        return {0: retrievers}
+    
+    num_gpus = torch.cuda.device_count()
+    if num_gpus <= 1:
+        return {0: retrievers}
+    
+    # Distribute models across GPUs
+    gpu_assignments = {}
+    for i, retriever in enumerate(retrievers):
+        gpu_id = i % num_gpus
+        if gpu_id not in gpu_assignments:
+            gpu_assignments[gpu_id] = []
+        gpu_assignments[gpu_id].append(retriever)
+    
+    print(f"🔀 MULTI-GPU DISTRIBUTION:")
+    for gpu_id, models in gpu_assignments.items():
+        model_names = [r.model_name for r in models]
+        print(f"   GPU {gpu_id}: {model_names}")
+    
+    return gpu_assignments
+
+
 def run_optimized_stage1(config: Dict, dataset: str, rewriter: str, 
-                        top_k_input: int, top_k_output: int) -> Dict:
+                        top_k_input: int, top_k_output: int, multi_gpu: bool = False, models: List[str] = None) -> Dict:
     """Run optimized Stage 1 bi-encoder pipeline"""
     
     print("\n🎯 STAGE 1: OPTIMIZED BI-ENCODER DENSE RETRIEVAL")
@@ -133,25 +177,45 @@ def run_optimized_stage1(config: Dict, dataset: str, rewriter: str,
     
     stage_start_time = time.time()
     
+    # Start progress monitoring
+    if PROGRESS_INTERVAL > 0:
+        print(f"📊 Starting progress monitor (updates every {PROGRESS_INTERVAL}s)")
+        start_progress_monitor()
+    
     # Create optimized retrievers
     print("🔧 Initializing optimized bi-encoder retrievers...")
     retrievers = create_optimized_bi_encoder_retrievers(
-        config, dataset, rewriter, 'stage1_bi_encoders'
+        config, dataset, rewriter, 'stage1_bi_encoders', models
     )
     
     print(f"✅ Created {len(retrievers)} optimized retrievers")
+    
+    # Multi-GPU distribution if enabled
+    if multi_gpu and torch.cuda.device_count() > 1:
+        gpu_assignments = distribute_models_to_gpus(retrievers)
+        print(f"🚀 Multi-GPU processing enabled with {len(gpu_assignments)} GPUs")
+    else:
+        gpu_assignments = {0: retrievers}
+        print("🔧 Single-GPU processing")
     
     # Input and output paths
     input_file = f"../fused_run_files/{dataset}/{rewriter}_{dataset}_fused.txt"
     results_dir = f"../dense_run_files/run_files/stage1_bi_encoders"
     os.makedirs(results_dir, exist_ok=True)
     
-    # Process each model
+    # Process each GPU group
     stage_results = {}
     
-    for i, retriever in enumerate(retrievers):
-        print(f"\n📋 Processing {retriever.model_name} ({i+1}/{len(retrievers)}):")
-        print("-" * 50)
+    for gpu_id, gpu_retrievers in gpu_assignments.items():
+        print(f"\n🔥 Processing GPU {gpu_id} with {len(gpu_retrievers)} models")
+        
+        for i, retriever in enumerate(gpu_retrievers):
+            # Force model to specific GPU
+            if torch.cuda.is_available() and hasattr(retriever, 'model'):
+                retriever.model = retriever.model.to(f'cuda:{gpu_id}')
+            
+            print(f"\n📋 Processing {retriever.model_name} on GPU {gpu_id} ({i+1}/{len(gpu_retrievers)}):")
+            print("-" * 50)
         
         model_start_time = time.time()
         
@@ -214,14 +278,23 @@ def main():
     parser.add_argument('--stages', type=int, default=1, help='Number of stages to run (1-4)')
     parser.add_argument('--top-k-stage1-input', type=int, default=1000)
     parser.add_argument('--top-k-stage1-output', type=int, default=1000)
+    parser.add_argument('--multi-gpu', action='store_true', help='Enable multi-GPU processing')
+    parser.add_argument('--progress-interval', type=int, default=10, help='Progress update interval (seconds)')
+    parser.add_argument('--models', nargs='+', help='Specific models to run (default: all models)')
     
     args = parser.parse_args()
+    
+    # Set global progress interval for monitoring
+    global PROGRESS_INTERVAL
+    PROGRESS_INTERVAL = args.progress_interval
     
     print("🚀 OPTIMIZED COMPREHENSIVE DENSE RETRIEVAL PIPELINE")
     print("=" * 60)
     print(f"Dataset: {args.dataset}")
     print(f"Rewriter: {args.rewriter}")
     print(f"Stages: {args.stages}")
+    print(f"Multi-GPU: {'✅ ENABLED' if args.multi_gpu else '❌ Disabled'}")
+    print(f"Progress updates: Every {args.progress_interval}s")
     print(f"Max VRAM utilization: 90%")
     print(f"Document cache: 50GB RAM")
     print(f"PyTerrier meta index: 7.9GB RAM")
@@ -253,7 +326,8 @@ def main():
         if args.stages >= 1:
             stage1_results = run_optimized_stage1(
                 config, args.dataset, args.rewriter,
-                args.top_k_stage1_input, args.top_k_stage1_output
+                args.top_k_stage1_input, args.top_k_stage1_output,
+                multi_gpu=args.multi_gpu, models=args.models
             )
         
         # TODO: Add optimized stages 2-4 here
