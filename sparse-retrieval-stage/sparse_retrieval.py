@@ -10,8 +10,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
 # Initialize PyTerrier
+# UPDATED: Allocated 500GB to JVM to leverage your 700GB+ RAM availability
 if not pt.started():
-    pt.init()
+    pt.init(mem="500g")
 
 # ==========================================
 # CONFIGURATION
@@ -35,9 +36,9 @@ REFINE_RADIUS_B = 0.2
 REFINE_RADIUS_C = 2.0
 
 # 3. System Resources
-# NOTE: Reduced to 32 to prevent I/O thrashing and JVM Memory exhaustion.
-# Each worker creates its own Index instance, consuming memory.
-MAX_WORKERS = 32
+# UPDATED: Increased to 60 workers to utilize 120 CPU cores.
+# The 500GB heap allocation ensures each worker has enough RAM for its index instance.
+MAX_WORKERS = 60
 
 # Thread Local Storage to hold the Index instance per thread
 thread_local = threading.local()
