@@ -5,6 +5,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
@@ -27,14 +28,19 @@ GLOBAL_PL2_GRID = {
     "c": [0.1, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0]
 }
 
-# 2. Refinement Settings (Used for subsequent datasets)
-REFINE_STEPS = 5  # Number of points in the local grid
-REFINE_RADIUS_K1 = 0.4  # Search +/- 0.4 around previous best
-REFINE_RADIUS_B = 0.2   # Search +/- 0.2 around previous best
-REFINE_RADIUS_C = 2.0   # Search +/- 2.0 around previous best
+# 2. Refinement Settings
+REFINE_STEPS = 5
+REFINE_RADIUS_K1 = 0.4
+REFINE_RADIUS_B = 0.2
+REFINE_RADIUS_C = 2.0
 
 # 3. System Resources
-MAX_WORKERS = 60  # Adjust based on I/O bandwidth, even with 120 cores
+# NOTE: Reduced to 32 to prevent I/O thrashing and JVM Memory exhaustion.
+# Each worker creates its own Index instance, consuming memory.
+MAX_WORKERS = 32
+
+# Thread Local Storage to hold the Index instance per thread
+thread_local = threading.local()
 
 # ==========================================
 # HELPERS
@@ -63,16 +69,10 @@ def load_queries(query_path):
     if 'text' in queries_df.columns:
         queries_df = queries_df.rename(columns={'text': 'query'})
     queries_df['qid'] = queries_df['qid'].astype(str)
-    
-    # Tokenize: Ensures simple whitespace tokenization matches Terrier's expectations
-    # This prevents issues with special chars in raw query strings
     queries_df = pt.rewrite.tokenise()(queries_df)
     return queries_df
 
 def generate_refined_grid(center, radius, steps, min_val=0.01):
-    """
-    Creates a linear space grid centered around 'center'.
-    """
     start = max(min_val, center - radius)
     end = center + radius
     grid = np.linspace(start, end, steps)
@@ -93,52 +93,61 @@ def save_chart(fig, chart_dir, filename):
 # CORE EVALUATION LOGIC
 # ==========================================
 
-def evaluate_single_config(index, topics, qrels, model_type, params, target_metric):
+def get_thread_index(index_path):
     """
-    Runs a single configuration and returns the score.
-    Designed to be run in a thread.
+    Returns a thread-local instance of the index.
+    This ensures each thread has its own file pointers, preventing race conditions.
+    """
+    if not hasattr(thread_local, "index"):
+        # print(f"DEBUG: Opening new index instance for thread {threading.get_ident()}")
+        thread_local.index = pt.IndexFactory.of(index_path)
+    return thread_local.index
+
+def evaluate_single_config(index_path, topics, qrels, model_type, params, target_metric):
+    """
+    Runs a single configuration safely using a thread-local index.
     """
     try:
+        # Get the index specific to this thread
+        index = get_thread_index(index_path)
+        
         if model_type == "BM25":
-            # Using standard BatchRetrieve with controls
-            model = pt.BatchRetrieve(index, wmodel="BM25", 
-                                   controls={"c": params['k1'], "bm25.b": params['b']}, 
-                                   verbose=False)
+            # Using new pt.terrier.Retriever API
+            model = pt.terrier.Retriever(index, wmodel="BM25", 
+                                       controls={"c": params['k1'], "bm25.b": params['b']}, 
+                                       verbose=False)
         elif model_type == "PL2":
-            model = pt.BatchRetrieve(index, wmodel="PL2", 
-                                   controls={"c": params['c']}, 
-                                   verbose=False)
+            model = pt.terrier.Retriever(index, wmodel="PL2", 
+                                       controls={"c": params['c']}, 
+                                       verbose=False)
         
         # 1. Retrieve
         res = model.transform(topics)
         
         # 2. Evaluate
-        # We use Utils.evaluate for speed (avoids full Experiment overhead)
         metrics = pt.Utils.evaluate(res, qrels, metrics=[target_metric])
         score = metrics[target_metric]
         
         return {**params, "score": score}
         
     except Exception as e:
+        # Catch errors to prevent killing the whole pool, but print them
         print(f"Error evaluating {model_type} {params}: {e}")
         return {**params, "score": -1.0}
 
-def run_grid_search(index, topics, qrels, model_type, param_grid_list, target_metric, desc):
+def run_grid_search(index_path, topics, qrels, model_type, param_grid_list, target_metric, desc):
     """
     Executes the grid search in parallel.
-    param_grid_list: List of dictionaries, e.g., [{'k1': 1.2, 'b': 0.75}, ...]
+    Passes 'index_path' instead of 'index' object to allow thread-local instantiation.
     """
     results = []
     
-    # Use ThreadPoolExecutor for parallel execution (Terrier releases GIL)
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submit all tasks
         futures = {
-            executor.submit(evaluate_single_config, index, topics, qrels, model_type, p, target_metric): p 
+            executor.submit(evaluate_single_config, index_path, topics, qrels, model_type, p, target_metric): p 
             for p in param_grid_list
         }
         
-        # Process as they complete with progress bar
         for future in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="cfg"):
             result = future.result()
             results.append(result)
@@ -151,10 +160,13 @@ def run_grid_search(index, topics, qrels, model_type, param_grid_list, target_me
 
 def main():
     env = load_env()
-    # Loading index. Standard way.
     index_path = env['paths']['index_path']
-    index = pt.IndexFactory.of(index_path)
     
+    # Verify index exists before starting
+    if not os.path.exists(index_path):
+        print(f"Error: Index path not found: {index_path}")
+        return
+
     run_dir = env['paths']['sparse_run_directory']
     eval_dir = env['paths']['evaluation_directory']
     best_params_path = env['paths']['best_params_path']
@@ -163,7 +175,6 @@ def main():
     metrics = env['eval_metrics']
     target_metric = metrics[0]
 
-    # Tracking Best Parameters
     current_best_bm25 = {"k1": None, "b": None}
     current_best_pl2 = {"c": None}
     
@@ -184,13 +195,12 @@ def main():
         qrels = pt.io.read_qrels(qrel_path)
 
         # -----------------------------------------------
-        # 1. Prepare Search Grids (List of Dicts)
+        # 1. Prepare Search Grids
         # -----------------------------------------------
         bm25_configs = []
         pl2_configs = []
 
         if current_best_bm25["k1"] is None:
-            # Global Grid
             print(">> Phase: Global Search")
             for k1 in GLOBAL_BM25_GRID["k1"]:
                 for b in GLOBAL_BM25_GRID["b"]:
@@ -199,7 +209,6 @@ def main():
             for c in GLOBAL_PL2_GRID["c"]:
                 pl2_configs.append({"c": c})
         else:
-            # Refined Grid
             print(f">> Phase: Refined Search (Center: BM25 {current_best_bm25}, PL2 {current_best_pl2})")
             k1_vals = generate_refined_grid(current_best_bm25["k1"], REFINE_RADIUS_K1, REFINE_STEPS)
             b_vals = generate_refined_grid(current_best_bm25["b"], REFINE_RADIUS_B, REFINE_STEPS, min_val=0.1)
@@ -213,13 +222,17 @@ def main():
                 pl2_configs.append({"c": c})
 
         # -----------------------------------------------
-        # 2. Optimize BM25 (Parallel)
+        # 2. Optimize BM25
         # -----------------------------------------------
         print(f"\n--- Optimizing BM25 ({len(bm25_configs)} configs) ---")
-        bm25_results = run_grid_search(index, topics, qrels, "BM25", bm25_configs, target_metric, f"BM25 Grid ({dataset})")
+        bm25_results = run_grid_search(index_path, topics, qrels, "BM25", bm25_configs, target_metric, f"BM25 Grid ({dataset})")
         
-        # Process Results
         df_bm25 = pd.DataFrame(bm25_results)
+        # Handle cases where all might have failed
+        if df_bm25['score'].max() < 0:
+            print("CRITICAL ERROR: All BM25 runs failed. Check logs.")
+            return
+
         best_bm25_row = df_bm25.loc[df_bm25['score'].idxmax()]
         
         local_best_bm25 = {
@@ -232,8 +245,9 @@ def main():
         current_best_bm25["k1"] = local_best_bm25["k1"]
         current_best_bm25["b"] = local_best_bm25["b"]
 
-        # Save Best Run
-        best_bm25_model = pt.BatchRetrieve(index, wmodel="BM25", 
+        # Save Best Run (Main thread can open its own index safely)
+        main_index = pt.IndexFactory.of(index_path)
+        best_bm25_model = pt.terrier.Retriever(main_index, wmodel="BM25", 
                                          controls={"c": local_best_bm25['k1'], "bm25.b": local_best_bm25['b']})
         save_trec_run(best_bm25_model, topics, run_dir, 
                       f"{dataset}_BEST_bm25_k1-{local_best_bm25['k1']:.2f}_b-{local_best_bm25['b']:.2f}.run")
@@ -246,13 +260,16 @@ def main():
         save_chart(plt.gcf(), chart_dir, f"{dataset}_bm25_optimization.png")
 
         # -----------------------------------------------
-        # 3. Optimize PL2 (Parallel)
+        # 3. Optimize PL2
         # -----------------------------------------------
         print(f"\n--- Optimizing PL2 ({len(pl2_configs)} configs) ---")
-        pl2_results = run_grid_search(index, topics, qrels, "PL2", pl2_configs, target_metric, f"PL2 Grid ({dataset})")
+        pl2_results = run_grid_search(index_path, topics, qrels, "PL2", pl2_configs, target_metric, f"PL2 Grid ({dataset})")
         
-        # Process Results
         df_pl2 = pd.DataFrame(pl2_results)
+        if df_pl2['score'].max() < 0:
+            print("CRITICAL ERROR: All PL2 runs failed. Check logs.")
+            return
+
         best_pl2_row = df_pl2.loc[df_pl2['score'].idxmax()]
         
         local_best_pl2 = {
@@ -264,13 +281,12 @@ def main():
         current_best_pl2["c"] = local_best_pl2["c"]
 
         # Save Best Run
-        best_pl2_model = pt.BatchRetrieve(index, wmodel="PL2", controls={"c": local_best_pl2['c']})
+        best_pl2_model = pt.terrier.Retriever(main_index, wmodel="PL2", controls={"c": local_best_pl2['c']})
         save_trec_run(best_pl2_model, topics, run_dir, 
                       f"{dataset}_BEST_pl2_c-{local_best_pl2['c']:.2f}.run")
 
         # Plot Line
         plt.figure(figsize=(10, 6))
-        # Sort by c for proper line plotting
         df_pl2_sorted = df_pl2.sort_values(by="c")
         plt.plot(df_pl2_sorted['c'], df_pl2_sorted['score'], marker='o', linestyle='-')
         plt.title(f"PL2 Optimization ({dataset})")
@@ -287,7 +303,7 @@ def main():
             "model": "BM25",
             "k1": local_best_bm25['k1'],
             "b": local_best_bm25['b'],
-            "param_c": None, # PL2 param
+            "param_c": None,
             "metric": target_metric,
             "value": local_best_bm25["score"]
         })
@@ -301,7 +317,6 @@ def main():
             "value": local_best_pl2["score"]
         })
 
-    # Final Save
     print(f"\nSaving optimization history to {best_params_path}")
     pd.DataFrame(history_log).to_csv(best_params_path, index=False)
     print("Optimization Complete.")
