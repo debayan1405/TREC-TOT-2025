@@ -1,560 +1,239 @@
-"""
-Sparse retrieval module for PyTerrier experiments.
-Implements wrapper functions for BM25, PL2, and TF_IDF retrievers with caching.
-Updated with enhanced dynamic path creation and evaluation storage.
-"""
-import os
-import pandas as pd
-
 import pyterrier as pt
-from pyterrier.transformer import Transformer
+import pandas as pd
+import json
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
-from pathlib import Path
-from typing import Dict, Any, List, Optional
-from config_loader import ConfigLoader
-from data_loader import DataLoader
+# Initialize PyTerrier
+if not pt.started():
+    pt.init()
 
-import re
+# ==========================================
+# CONFIGURATION
+# ==========================================
+# The order of datasets to fine-tune on
+DATASET_SEQUENCE = ["train", "dev1", "dev2", "dev3"]
 
+# 1. Global Grid (Used for the first dataset to find rough area)
+GLOBAL_BM25_GRID = {
+    "k1": [0.4, 0.8, 1.2, 1.6, 2.0, 2.5, 3.0],
+    "b": [0.3, 0.5, 0.6, 0.75, 0.9, 1.0]
+}
+GLOBAL_PL2_GRID = {
+    "c": [0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0]
+}
 
-class QuerySanitiser(Transformer):
+# 2. Refinement Settings (Used for subsequent datasets)
+# We will search: [best - delta, best, best + delta]
+# You can adjust steps to make it more granular
+REFINE_STEPS = 5  # Number of points in the local grid
+REFINE_RADIUS_K1 = 0.4  # Search +/- 0.4 around previous best
+REFINE_RADIUS_B = 0.2   # Search +/- 0.2 around previous best
+REFINE_RADIUS_C = 2.0   # Search +/- 2.0 around previous best
+
+# ==========================================
+# HELPERS
+# ==========================================
+
+def load_env(env_path="env.json"):
+    with open(env_path, 'r') as f:
+        return json.load(f)
+
+def get_dataset_paths(env, dataset_key):
+    paths = env['paths']
+    key_map = {
+        "train": ("train_queries_path", "train_qrels_path"),
+        "dev1": ("dev_1_queries_path", "dev1_qrels_path"),
+        "dev2": ("dev_2_queries_path", "dev2_qrels_path"),
+        "dev3": ("dev_3_queries_path", "dev3_qrels_path"),
+        "test": ("test_queries_path", "test_qrels_path")
+    }
+    q_key, qrel_key = key_map[dataset_key]
+    return paths[q_key], paths[qrel_key]
+
+def load_queries(query_path):
+    queries_df = pd.read_json(query_path, lines=True)
+    if 'text' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'text': 'query'})
+    queries_df['qid'] = queries_df['qid'].astype(str)
+    return queries_df
+
+def generate_refined_grid(center, radius, steps, min_val=0.01):
     """
-    A custom transformer that cleans a query string to make it safe for
-    the old Terrier v0.1.5 parser. It removes punctuation and returns a
-    single, space-separated string.
+    Creates a linear space grid centered around 'center'.
     """
+    start = max(min_val, center - radius)
+    end = center + radius
+    # Ensure unique values and sort
+    grid = np.linspace(start, end, steps)
+    return sorted(list(set(np.round(grid, 2))))
 
-    def transform(self, topics: pd.DataFrame) -> pd.DataFrame:
-        topics_c = topics.copy()
+def save_trec_run(model, topics, run_dir, filename):
+    os.makedirs(run_dir, exist_ok=True)
+    output_path = os.path.join(run_dir, filename)
+    pt.io.write_results(model.transform(topics), output_path)
 
-        # This function cleans the query
-        def clean_query(query):
-            # Remove apostrophes and other problematic punctuation
-            # by keeping only letters, numbers, and spaces
-            text = re.sub(r'[^a-zA-Z0-9 ]', ' ', query)
-            # Normalize whitespace (e.g., convert multiple spaces to one)
-            return " ".join(text.split())
+# ==========================================
+# MAIN LOGIC
+# ==========================================
 
-        # Apply the cleaning function to the 'query' column
-        topics_c['query'] = topics_c['query'].apply(clean_query)
-        return topics_c
+def main():
+    env = load_env()
+    index = pt.IndexFactory.of(env['paths']['index_path'])
+    
+    run_dir = env['paths']['sparse_run_directory']
+    eval_dir = env['paths']['evaluation_directory']
+    best_params_path = env['paths']['best_params_path']
+    chart_dir = os.path.join(eval_dir, "charts")
+    
+    metrics = env['eval_metrics']
+    target_metric = metrics[0]
 
+    # State variables to hold the "Previous Best"
+    # Initialize with None so we know to use Global Grid first
+    current_best_bm25 = {"k1": None, "b": None}
+    current_best_pl2 = {"c": None}
+    
+    history_log = []
 
-class SparseRetrieval:
-    """Handles sparse retrieval algorithms with enhanced path management."""
+    print(f"Starting Sequential Optimization: {DATASET_SEQUENCE}")
+    print(f"Target Metric: {target_metric}")
 
-    # Supported sparse retrieval models
-    SUPPORTED_MODELS = ["BM25", "PL2", "TF_IDF"]
+    for dataset in DATASET_SEQUENCE:
+        print(f"\n{'='*40}")
+        print(f"PROCESSING DATASET: {dataset}")
+        print(f"{'='*40}")
 
-    def __init__(self, config: ConfigLoader, data_loader: DataLoader):
-        """
-        Initialize sparse retrieval handler.
+        # Load Data
+        q_path, qrel_path = get_dataset_paths(env, dataset)
+        topics = load_queries(q_path)
+        qrels = pt.io.read_qrels(qrel_path)
 
-        Args:
-            config (ConfigLoader): Configuration loader instance
-            data_loader (DataLoader): Data loader instance
-        """
-        self.config = config
-        self.data_loader = data_loader
-        self.index = data_loader.get_index()
-
-        # Ensure directories exist
-        self.config.ensure_run_directory_exists()
-        self.config.ensure_evaluation_directory_exists()
-
-    def _get_rewriter_name(self, query_source: str) -> str:
-        """
-        Extract rewriter name from query source.
-
-        Args:
-            query_source (str): Source of queries (original, rewritten_<model>, summarized)
-
-        Returns:
-            str: Rewriter name for file naming
-        """
-        if query_source == "original":
-            return "original"
-        elif query_source == "summarized":
-            return "summarized"
-        elif query_source.startswith("rewritten_"):
-            return query_source.replace("rewritten_", "")
+        # -----------------------------------------------
+        # 1. Determine Search Grids
+        # -----------------------------------------------
+        if current_best_bm25["k1"] is None:
+            # First run: Use Global Grid
+            bm25_k1_grid = GLOBAL_BM25_GRID["k1"]
+            bm25_b_grid = GLOBAL_BM25_GRID["b"]
+            pl2_c_grid = GLOBAL_PL2_GRID["c"]
+            print("Using GLOBAL Grid search space.")
         else:
-            return query_source
-
-    def _get_run_output_directory(self, dataset_version: str) -> str:
-        """
-        Generate run output directory based on dataset version.
-
-        Args:
-            dataset_version (str): Dataset version (train, dev-1, etc.)
-
-        Returns:
-            str: Path to run output directory
-        """
-        base_run_dir = Path(self.config.get_sparse_run_directory())
-        output_dir = base_run_dir / dataset_version
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return str(output_dir)
-
-    def _get_eval_output_directory(self, dataset_version: str) -> str:
-        """
-        Generate evaluation output directory based on dataset version.
-
-        Args:
-            dataset_version (str): Dataset version (train, dev-1, etc.)
-
-        Returns:
-            str: Path to evaluation output directory
-        """
-        base_eval_dir = Path(self.config.get_evaluation_directory())
-        eval_dir = base_eval_dir / "evals" / dataset_version
-        eval_dir.mkdir(parents=True, exist_ok=True)
-        return str(eval_dir)
-
-    def _get_run_filename(self, algorithm_name: str, query_source: str,
-                          dataset_version: str) -> str:
-        """
-        Generate run filename following the naming convention:
-        <rewriter_name>_<dataset_version>_<algorithm_name>_<k_sparse>.txt
-
-        Args:
-            algorithm_name (str): Name of the algorithm
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-
-        Returns:
-            str: Full path to output file
-        """
-        output_dir = self._get_run_output_directory(dataset_version)
-        rewriter_name = self._get_rewriter_name(query_source)
-        k_sparse = self.config.get_k_sparse()
-
-        filename = f"{rewriter_name}_{dataset_version}_{algorithm_name.lower()}_{k_sparse}.txt"
-        return os.path.join(output_dir, filename)
-
-    def _get_eval_filename(self, algorithm_name: str, query_source: str,
-                           dataset_version: str) -> str:
-        """
-        Generate evaluation filename following the naming convention:
-        <rewriter_name>_<algorithm_name>_<dataset_version>_eval.csv
-
-        Args:
-            algorithm_name (str): Name of the algorithm
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-
-        Returns:
-            str: Full path to evaluation file
-        """
-        eval_dir = self._get_eval_output_directory(dataset_version)
-        rewriter_name = self._get_rewriter_name(query_source)
-
-        filename = f"{rewriter_name}_{algorithm_name.lower()}_{dataset_version}_eval.csv"
-        return os.path.join(eval_dir, filename)
-
-    def _save_run_results(self, results_df: pd.DataFrame, algorithm_name: str,
-                          query_source: str, dataset_version: str) -> None:
-        """
-        Save run results dataframe to text file with enhanced naming.
-
-        Args:
-            results_df (pd.DataFrame): Results dataframe
-            algorithm_name (str): Name of the algorithm
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-        """
-        output_file = self._get_run_filename(
-            algorithm_name, query_source, dataset_version)
-        k_sparse = self.config.get_k_sparse()
-
-        # Get top k_sparse results per query
-        if 'qid' in results_df.columns:
-            # Ensure we get top k per query, not globally
-            top_k_results = (results_df.groupby('qid')
-                             .apply(lambda x: x.nsmallest(min(k_sparse, len(x)), 'rank'))
-                             .reset_index(drop=True))
-        else:
-            top_k_results = results_df.head(k_sparse)
-
-        # Save to tab-separated text file in TREC format
-        if all(col in top_k_results.columns for col in ['qid', 'docno', 'rank', 'score']):
-            # TREC format: qid Q0 docno rank score run_name
-            trec_format = top_k_results[[
-                'qid', 'docno', 'rank', 'score']].copy()
-            trec_format.insert(1, 'Q0', 'Q0')  # Add Q0 column
-
-            rewriter_name = self._get_rewriter_name(query_source)
-            run_name = f"{rewriter_name}_{dataset_version}_{algorithm_name.lower()}"
-            trec_format.insert(5, 'run_name', run_name)
-
-            trec_format.to_csv(
-                output_file,
-                sep='\t',
-                index=False,
-                header=False
-            )
-        else:
-            # Fallback to regular format
-            top_k_results.to_csv(
-                output_file,
-                sep='\t',
-                index=False,
-                header=True
-            )
-
-        print(f"Saved {len(top_k_results)} run results for {algorithm_name} "
-              f"({query_source}, {dataset_version}) to {output_file}")
-
-    def _save_eval_results(self, eval_df: pd.DataFrame, algorithm_name: str,
-                           query_source: str, dataset_version: str) -> None:
-        """
-        Save evaluation results to CSV file.
-
-        Args:
-            eval_df (pd.DataFrame): Evaluation results dataframe
-            algorithm_name (str): Name of the algorithm
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-        """
-        eval_file = self._get_eval_filename(
-            algorithm_name, query_source, dataset_version)
-
-        eval_df.to_csv(eval_file, index=True)
-
-        print(f"Saved evaluation results for {algorithm_name} "
-              f"({query_source}, {dataset_version}) to {eval_file}")
-
-    def _load_cached_run_results(self, algorithm_name: str, query_source: str,
-                                 dataset_version: str) -> Optional[pd.DataFrame]:
-        """
-        Load cached run results if they exist.
-
-        Args:
-            algorithm_name (str): Name of the algorithm
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-
-        Returns:
-            pd.DataFrame or None: Cached results or None if not found
-        """
-        output_file = self._get_run_filename(
-            algorithm_name, query_source, dataset_version)
-
-        if os.path.exists(output_file):
-            try:
-                # Try to load as TREC format first (no header)
-                cached_df = pd.read_csv(output_file, sep='\t', header=None)
-
-                if len(cached_df.columns) == 6:
-                    # TREC format: qid Q0 docno rank score run_name
-                    cached_df.columns = ["qid", "Q0",
-                                         "docno", "rank", "score", "run_name"]
-                    # Keep only needed columns
-                    cached_df = cached_df[["qid", "docno", "score", "rank"]]
-                else:
-                    # Try with header
-                    cached_df = pd.read_csv(output_file, sep='\t')
-
-                # Validate expected columns
-                expected_cols = ["qid", "docno", "score", "rank"]
-                if all(col in cached_df.columns for col in expected_cols):
-                    print(f"Loaded cached run results for {algorithm_name} "
-                          f"({query_source}, {dataset_version}) from {output_file}")
-                    return cached_df
-                else:
-                    print(
-                        f"Warning: Cached file {output_file} has unexpected format. Re-running...")
-                    return None
-            except Exception as e:
-                print(
-                    f"Warning: Error loading cached run results for {algorithm_name}: {e}. Re-running...")
-                return None
-
-        return None
-
-    def _create_retriever(self, wmodel: str) -> Any:
-        """
-        Create a robust PyTerrier retrieval pipeline that tokenizes
-        queries before passing them to the backend.
-        """
-        if wmodel not in self.SUPPORTED_MODELS:
-            raise ValueError(
-                f"Unsupported weighting model: {wmodel}. Supported models: {self.SUPPORTED_MODELS}")
-
-        retriever = pt.BatchRetrieve(self.index, wmodel=wmodel)
-
-        # Use the new QuerySanitiser class
-        return QuerySanitiser() >> retriever
-
-    def run_retrieval(self, wmodel: str, topics: pd.DataFrame, query_source: str,
-                      dataset_version: str, force_rerun: bool = False) -> pd.DataFrame:
-        """
-        Run sparse retrieval for given weighting model with enhanced path management.
-
-        Args:
-            wmodel (str): Weighting model name (BM25, PL2, TF_IDF)
-            topics (pd.DataFrame): Topics dataframe with columns ['qid', 'query']
-            query_source (str): Source of queries (original, rewritten_<model>, summarized)
-            dataset_version (str): Dataset version (train, dev-1, etc.)
-            force_rerun (bool): Force re-running even if cached results exist
-
-        Returns:
-            pd.DataFrame: Results dataframe with columns ["qid", "query", "docno", "score", "rank"]
-        """
-        # Check for cached results first (unless forced to rerun)
-        if not force_rerun:
-            cached_results = self._load_cached_run_results(
-                wmodel, query_source, dataset_version)
-            if cached_results is not None:
-                # Add query text if not present
-                if "query" not in cached_results.columns:
-                    cached_results = cached_results.merge(
-                        topics[['qid', 'query']], on='qid', how='left')
-                return cached_results
-
-        rewriter_name = self._get_rewriter_name(query_source)
-        print(
-            f"Running {wmodel} retrieval on {rewriter_name} queries for {dataset_version}...")
-
-        # Create retriever
-        retriever = self._create_retriever(wmodel)
-
-        # Run retrieval
-        try:
-            results = retriever.transform(topics)
-
-            # Ensure required columns are present
-            required_cols = ["qid", "docno", "score", "rank"]
-            missing_cols = [
-                col for col in required_cols if col not in results.columns]
-
-            if missing_cols:
-                raise ValueError(
-                    f"Missing required columns in results: {missing_cols}")
-
-            # Add query text if not present
-            if "query" not in results.columns:
-                results = results.merge(
-                    topics[['qid', 'query']], on='qid', how='left')
-
-            # Ensure proper column order and types
-            results = results[["qid", "query",
-                               "docno", "score", "rank"]].copy()
-            results['qid'] = results['qid'].astype(str)
-            results['score'] = pd.to_numeric(results['score'], errors='coerce')
-            results['rank'] = pd.to_numeric(results['rank'], errors='coerce')
-
-            # Sort by qid and rank for consistency
-            results = results.sort_values(
-                ['qid', 'rank']).reset_index(drop=True)
-
-            # Save results with enhanced naming
-            self._save_run_results(
-                results, wmodel, query_source, dataset_version)
-
-            return results
-
-        except Exception as e:
-            raise RuntimeError(f"Error running {wmodel} retrieval: {e}")
-
-    def run_all_models(self, topics: pd.DataFrame, query_source: str,
-                       dataset_version: str, force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
-        """
-        Run all supported sparse retrieval models.
-
-        Args:
-            topics (pd.DataFrame): Topics dataframe
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-            force_rerun (bool): Force re-running even if cached results exist
-
-        Returns:
-            Dict[str, pd.DataFrame]: Dictionary mapping model names to result dataframes
-        """
-        results = {}
-        rewriter_name = self._get_rewriter_name(query_source)
-
-        for model in self.SUPPORTED_MODELS:
-            try:
-                results[model] = self.run_retrieval(
-                    model, topics, query_source, dataset_version, force_rerun)
-                print(
-                    f"✓ Successfully completed {model} for {rewriter_name} on {dataset_version}")
-            except Exception as e:
-                print(f"✗ Error running {model}: {e}")
-                continue
-
-        return results
-
-    def run_experiment(self, topics: pd.DataFrame, qrels: pd.DataFrame, query_source: str,
-                       dataset_version: str, models: Optional[List[str]] = None,
-                       force_rerun: bool = False) -> pd.DataFrame:
-        """
-        Run PyTerrier experiment with multiple retrievers and enhanced result storage.
-
-        Args:
-            topics (pd.DataFrame): Topics dataframe
-            qrels (pd.DataFrame): Qrels dataframe
-            query_source (str): Source of queries
-            dataset_version (str): Dataset version
-            models (List[str], optional): List of models to run. Defaults to all supported models.
-            force_rerun (bool): Force re-running even if cached results exist
-
-        Returns:
-            pd.DataFrame: Experiment evaluation results
-        """
-        if models is None:
-            models = self.SUPPORTED_MODELS
-
-        # Validate models
-        invalid_models = [m for m in models if m not in self.SUPPORTED_MODELS]
-        if invalid_models:
-            raise ValueError(f"Invalid models specified: {invalid_models}")
-
-        # Create retrievers
-        retrievers = []
-        retriever_names = []
-        rewriter_name = self._get_rewriter_name(query_source)
-
-        for model in models:
-            try:
-                retriever = self._create_retriever(model)
-                retrievers.append(retriever)
-                retriever_names.append(f"{rewriter_name}_{model}")
-            except Exception as e:
-                print(f"Warning: Could not create {model} retriever: {e}")
-                continue
-
-        if not retrievers:
-            raise ValueError("No valid retrievers could be created")
-
-        # Run experiment
-        eval_metrics = self.config.get_eval_metrics()
-
-        try:
-            experiment_results = pt.Experiment(
-                retrievers,
-                topics,
-                qrels,
-                eval_metrics=eval_metrics,
-                names=retriever_names,
-                verbose=True
-            )
-
-            # Save individual evaluation results for each model
-            for i, model in enumerate(models):
-                if i < len(experiment_results):
-                    # Extract single model results
-                    single_model_eval = experiment_results.iloc[[i]]
-                    self._save_eval_results(
-                        single_model_eval, model, query_source, dataset_version)
-
-            # Save combined experiment results
-            combined_eval_dir = self._get_eval_output_directory(
-                dataset_version)
-            combined_eval_file = Path(
-                combined_eval_dir) / f"combined_{rewriter_name}_{dataset_version}_eval.csv"
-            experiment_results.to_csv(combined_eval_file, index=True)
-            print(
-                f"Combined experiment results saved to: {combined_eval_file}")
-
-            # Cache individual run results if not already cached
-            if not force_rerun:
-                for model in models:
-                    run_file = self._get_run_filename(
-                        model, query_source, dataset_version)
-                    if not os.path.exists(run_file):
-                        try:
-                            self.run_retrieval(
-                                model, topics, query_source, dataset_version, force_rerun=False)
-                        except Exception as e:
-                            print(
-                                f"Warning: Could not cache {model} results: {e}")
-
-            return experiment_results
-
-        except Exception as e:
-            raise RuntimeError(f"Error running experiment: {e}")
-
-    def run_single_dataset_experiment(self, dataset_version: str,
-                                      query_sources: Optional[List[str]] = None,
-                                      models: Optional[List[str]] = None,
-                                      force_rerun: bool = False) -> Dict[str, pd.DataFrame]:
-        """
-        Run experiments across multiple query sources for a single dataset version.
-
-        Args:
-            dataset_version (str): Dataset version to process
-            query_sources (List[str], optional): Query sources to test. Auto-detected if None.
-            models (List[str], optional): Models to run. All if None.
-            force_rerun (bool): Force re-running experiments
-
-        Returns:
-            Dict[str, pd.DataFrame]: Mapping of query source to experiment results
-        """
-        # Load qrels (only for datasets that have qrels)
-        qrels_versions = ["train", "dev-1", "dev-2", "dev-3"]
-        if dataset_version in qrels_versions:
-            qrels = self.data_loader.load_qrels(dataset_version)
-        else:
-            print(
-                f"Warning: No qrels available for {dataset_version}. Skipping evaluation.")
-            qrels = None
-
-        # Auto-detect available query sources if not specified
-        if query_sources is None:
-            query_sources = self.data_loader.get_available_rewritten_sources(
-                dataset_version)
-
-        if models is None:
-            models = self.SUPPORTED_MODELS
-
-        results = {}
-
-        for query_source in query_sources:
-            rewriter_name = self._get_rewriter_name(query_source)
-            print(f"\n{'='*60}")
-            print(
-                f"Running experiment: {dataset_version} with {rewriter_name} queries")
-            print(f"{'='*60}")
-
-            try:
-                # Load topics for this source
-                topics = self.data_loader.load_topics(
-                    dataset_version, query_source)
-
-                # Validate data consistency only if qrels exist
-                if qrels is not None:
-                    self.data_loader.validate_data_consistency(
-                        topics, qrels, dataset_version)
-
-                    # Run experiment with evaluation
-                    experiment_result = self.run_experiment(
-                        topics=topics,
-                        qrels=qrels,
-                        query_source=query_source,
-                        dataset_version=dataset_version,
-                        models=models,
-                        force_rerun=force_rerun
-                    )
-                    results[query_source] = experiment_result
-                else:
-                    # Run retrieval only (no evaluation)
-                    retrieval_results = self.run_all_models(
-                        topics=topics,
-                        query_source=query_source,
-                        dataset_version=dataset_version,
-                        force_rerun=force_rerun
-                    )
-                    results[query_source] = retrieval_results
-                    print(
-                        f"✓ Successfully completed retrieval for {rewriter_name} (no evaluation)")
-
-                print(
-                    f"✓ Successfully completed experiment for {rewriter_name}")
-
-            except Exception as e:
-                print(f"✗ Error in experiment for {query_source}: {e}")
-                continue
-
-        return results
+            # Subsequent runs: Refine around previous best
+            print(f"Initializing search around previous best: BM25 {current_best_bm25}, PL2 {current_best_pl2}")
+            bm25_k1_grid = generate_refined_grid(current_best_bm25["k1"], REFINE_RADIUS_K1, REFINE_STEPS)
+            bm25_b_grid = generate_refined_grid(current_best_bm25["b"], REFINE_RADIUS_B, REFINE_STEPS, min_val=0.1)
+            pl2_c_grid = generate_refined_grid(current_best_pl2["c"], REFINE_RADIUS_C, REFINE_STEPS)
+
+        # -----------------------------------------------
+        # 2. Optimize BM25
+        # -----------------------------------------------
+        print(f"\n--- Optimizing BM25 on {dataset} ---")
+        best_score = -1
+        local_best_bm25 = {}
+        
+        # We collect data for heatmap
+        heatmap_data = []
+
+        for k1 in bm25_k1_grid:
+            for b in bm25_b_grid:
+                # Run experiment
+                model = pt.BatchRetrieve(index, wmodel="BM25", controls={"c": k1, "bm25.b": b})
+                res = pt.Experiment([model], topics, qrels, eval_metrics=[target_metric], verbose=False)
+                score = res.iloc[0][target_metric]
+                
+                heatmap_data.append({"k1": k1, "b": b, "score": score})
+                
+                if score > best_score:
+                    best_score = score
+                    local_best_bm25 = {"k1": k1, "b": b, "score": score}
+
+        print(f"Best BM25 on {dataset}: {local_best_bm25}")
+        
+        # Update State
+        current_best_bm25["k1"] = local_best_bm25["k1"]
+        current_best_bm25["b"] = local_best_bm25["b"]
+        
+        # Save Run
+        best_bm25_model = pt.BatchRetrieve(index, wmodel="BM25", 
+                                         controls={"c": local_best_bm25['k1'], "bm25.b": local_best_bm25['b']})
+        save_trec_run(best_bm25_model, topics, run_dir, 
+                      f"{dataset}_BEST_bm25_k1-{local_best_bm25['k1']}_b-{local_best_bm25['b']}.run")
+
+        # Plot Heatmap
+        df_bm25 = pd.DataFrame(heatmap_data)
+        pivot = df_bm25.pivot(index="k1", columns="b", values="score")
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(pivot, annot=True, cmap="viridis", fmt=".4f")
+        plt.title(f"BM25 Optimization ({dataset})\nRefined around previous best")
+        save_chart(plt.gcf(), chart_dir, f"{dataset}_bm25_optimization.png")
+
+        # -----------------------------------------------
+        # 3. Optimize PL2
+        # -----------------------------------------------
+        print(f"\n--- Optimizing PL2 on {dataset} ---")
+        best_score_pl2 = -1
+        local_best_pl2 = {}
+        line_data = []
+
+        for c in pl2_c_grid:
+            model = pt.BatchRetrieve(index, wmodel="PL2", controls={"c": c})
+            res = pt.Experiment([model], topics, qrels, eval_metrics=[target_metric], verbose=False)
+            score = res.iloc[0][target_metric]
+            
+            line_data.append({"c": c, "score": score})
+            
+            if score > best_score_pl2:
+                best_score_pl2 = score
+                local_best_pl2 = {"c": c, "score": score}
+
+        print(f"Best PL2 on {dataset}: {local_best_pl2}")
+
+        # Update State
+        current_best_pl2["c"] = local_best_pl2["c"]
+
+        # Save Run
+        best_pl2_model = pt.BatchRetrieve(index, wmodel="PL2", controls={"c": local_best_pl2['c']})
+        save_trec_run(best_pl2_model, topics, run_dir, 
+                      f"{dataset}_BEST_pl2_c-{local_best_pl2['c']}.run")
+
+        # Plot Line
+        df_pl2 = pd.DataFrame(line_data)
+        plt.figure(figsize=(8, 6))
+        plt.plot(df_pl2['c'], df_pl2['score'], marker='o')
+        plt.title(f"PL2 Optimization ({dataset})")
+        plt.xlabel("Parameter c")
+        plt.ylabel(target_metric)
+        plt.grid(True)
+        save_chart(plt.gcf(), chart_dir, f"{dataset}_pl2_optimization.png")
+
+        # -----------------------------------------------
+        # 4. Log Results
+        # -----------------------------------------------
+        history_log.append({
+            "dataset": dataset,
+            "model": "BM25",
+            "best_params": f"k1={local_best_bm25['k1']}, b={local_best_bm25['b']}",
+            "metric_value": local_best_bm25["score"]
+        })
+        history_log.append({
+            "dataset": dataset,
+            "model": "PL2",
+            "best_params": f"c={local_best_pl2['c']}",
+            "metric_value": local_best_pl2["score"]
+        })
+
+    # Final Save of History
+    print(f"\nSaving optimization history to {best_params_path}")
+    pd.DataFrame(history_log).to_csv(best_params_path, index=False)
+
+def save_chart(fig, chart_dir, filename):
+    os.makedirs(chart_dir, exist_ok=True)
+    output_path = os.path.join(chart_dir, filename)
+    fig.savefig(output_path)
+    plt.close(fig)
+
+if __name__ == "__main__":
+    main()
