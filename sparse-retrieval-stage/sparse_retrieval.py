@@ -55,9 +55,14 @@ def get_dataset_paths(env, dataset_key):
 
 def load_queries(query_path):
     queries_df = pd.read_json(query_path, lines=True)
+    # Handle different column naming conventions
+    if 'query_id' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'query_id': 'qid'})
     if 'text' in queries_df.columns:
         queries_df = queries_df.rename(columns={'text': 'query'})
     queries_df['qid'] = queries_df['qid'].astype(str)
+    # Tokenize queries to handle special characters
+    queries_df = pt.rewrite.tokenise()(queries_df)
     return queries_df
 
 def generate_refined_grid(center, radius, steps, min_val=0.01):
