@@ -5,14 +5,14 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Initialize PyTerrier
-# UPDATED: Allocated 500GB to JVM to leverage your 700GB+ RAM availability
-if not pt.started():
-    pt.init(mem="500g")
+# Initialize PyTerrier with large heap for parallel processing
+import os
+os.environ["JAVA_OPTS"] = "-Xmx600g -Xms200g"
+if not pt.java.started():
+    pt.java.init()
 
 # ==========================================
 # CONFIGURATION
@@ -36,12 +36,11 @@ REFINE_RADIUS_B = 0.2
 REFINE_RADIUS_C = 2.0
 
 # 3. System Resources
-# UPDATED: Increased to 60 workers to utilize 120 CPU cores.
-# The 500GB heap allocation ensures each worker has enough RAM for its index instance.
-MAX_WORKERS = 60
-
-# Thread Local Storage to hold the Index instance per thread
-thread_local = threading.local()
+# IMPORTANT: The current index uses compressed structures (BitFileBuffered) that are NOT thread-safe
+# Setting MAX_WORKERS > 1 causes "docid out of bounds" errors due to concurrent decompression
+# To enable parallelism, you would need to rebuild the index with different compression settings
+# or use uncompressed structures. For now, running sequentially to avoid corruption.
+MAX_WORKERS = 1
 
 # ==========================================
 # HELPERS
@@ -94,40 +93,55 @@ def save_chart(fig, chart_dir, filename):
 # CORE EVALUATION LOGIC
 # ==========================================
 
-def get_thread_index(index_path):
+def evaluate_single_config(index, topics_dict, qrels, model_type, params, target_metric):
     """
-    Returns a thread-local instance of the index.
-    This ensures each thread has its own file pointers, preventing race conditions.
-    """
-    if not hasattr(thread_local, "index"):
-        # print(f"DEBUG: Opening new index instance for thread {threading.get_ident()}")
-        thread_local.index = pt.IndexFactory.of(index_path)
-    return thread_local.index
-
-def evaluate_single_config(index_path, topics, qrels, model_type, params, target_metric):
-    """
-    Runs a single configuration safely using a thread-local index.
+    Runs a single configuration using a shared index object with threading.
+    topics_dict: Dictionary representation of topics for thread safety.
     """
     try:
-        # Get the index specific to this thread
-        index = get_thread_index(index_path)
+        # Convert topics_dict back to DataFrame
+        topics = pd.DataFrame(topics_dict)
         
         if model_type == "BM25":
-            # Using new pt.terrier.Retriever API
+            # Using BatchRetrieve with the shared index object
             model = pt.terrier.Retriever(index, wmodel="BM25", 
-                                       controls={"c": params['k1'], "bm25.b": params['b']}, 
-                                       verbose=False)
+                                   controls={"c": params['k1'], "bm25.b": params['b']}, 
+                                   verbose=False)
         elif model_type == "PL2":
             model = pt.terrier.Retriever(index, wmodel="PL2", 
-                                       controls={"c": params['c']}, 
-                                       verbose=False)
+                                   controls={"c": params['c']}, 
+                                   verbose=False)
         
         # 1. Retrieve
         res = model.transform(topics)
         
-        # 2. Evaluate
-        metrics = pt.Utils.evaluate(res, qrels, metrics=[target_metric])
-        score = metrics[target_metric]
+        # 2. Evaluate using ir_measures
+        import ir_measures
+        from ir_measures import calc_aggregate
+        
+        # Rename columns to match ir_measures expectations
+        qrels_formatted = qrels.rename(columns={
+            'qid': 'query_id',
+            'docno': 'doc_id', 
+            'label': 'relevance'
+        })
+        
+        res_formatted = res.rename(columns={
+            'qid': 'query_id',
+            'docno': 'doc_id'
+        })
+        
+        # Convert metric name: ndcg_cut_10 -> nDCG@10
+        metric_map = {
+            "ndcg_cut_10": "nDCG@10",
+            "ndcg_cut_1000": "nDCG@1000", 
+            "recall_1000": "R@1000",
+            "P_10": "P@10"
+        }
+        metric_name = metric_map.get(target_metric, target_metric)
+        metric_obj = ir_measures.parse_measure(metric_name)
+        metrics_dict = calc_aggregate([metric_obj], qrels_formatted, res_formatted)
+        score = metrics_dict[metric_obj]
         
         return {**params, "score": score}
         
@@ -136,16 +150,17 @@ def evaluate_single_config(index_path, topics, qrels, model_type, params, target
         print(f"Error evaluating {model_type} {params}: {e}")
         return {**params, "score": -1.0}
 
-def run_grid_search(index_path, topics, qrels, model_type, param_grid_list, target_metric, desc):
+def run_grid_search(index, topics, qrels, model_type, param_grid_list, target_metric, desc):
     """
-    Executes the grid search in parallel.
-    Passes 'index_path' instead of 'index' object to allow thread-local instantiation.
+    Executes the grid search in parallel using threading with a shared index.
+    Converts topics to dict to make it thread-safe.
     """
     results = []
+    topics_dict = topics.to_dict('list')  # Convert to dict for thread safety
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(evaluate_single_config, index_path, topics, qrels, model_type, p, target_metric): p 
+            executor.submit(evaluate_single_config, index, topics_dict, qrels, model_type, p, target_metric): p 
             for p in param_grid_list
         }
         
@@ -167,6 +182,11 @@ def main():
     if not os.path.exists(index_path):
         print(f"Error: Index path not found: {index_path}")
         return
+
+    # Load index once - will be shared across threads
+    print(f"Loading index from: {index_path}")
+    index = pt.IndexFactory.of(index_path)
+    print(f"Index loaded: {index.getCollectionStatistics().getNumberOfDocuments()} documents")
 
     run_dir = env['paths']['sparse_run_directory']
     eval_dir = env['paths']['evaluation_directory']
@@ -226,7 +246,7 @@ def main():
         # 2. Optimize BM25
         # -----------------------------------------------
         print(f"\n--- Optimizing BM25 ({len(bm25_configs)} configs) ---")
-        bm25_results = run_grid_search(index_path, topics, qrels, "BM25", bm25_configs, target_metric, f"BM25 Grid ({dataset})")
+        bm25_results = run_grid_search(index, topics, qrels, "BM25", bm25_configs, target_metric, f"BM25 Grid ({dataset})")
         
         df_bm25 = pd.DataFrame(bm25_results)
         # Handle cases where all might have failed
@@ -246,9 +266,8 @@ def main():
         current_best_bm25["k1"] = local_best_bm25["k1"]
         current_best_bm25["b"] = local_best_bm25["b"]
 
-        # Save Best Run (Main thread can open its own index safely)
-        main_index = pt.IndexFactory.of(index_path)
-        best_bm25_model = pt.terrier.Retriever(main_index, wmodel="BM25", 
+        # Save Best Run
+        best_bm25_model = pt.terrier.Retriever(index, wmodel="BM25", 
                                          controls={"c": local_best_bm25['k1'], "bm25.b": local_best_bm25['b']})
         save_trec_run(best_bm25_model, topics, run_dir, 
                       f"{dataset}_BEST_bm25_k1-{local_best_bm25['k1']:.2f}_b-{local_best_bm25['b']:.2f}.run")
@@ -264,7 +283,7 @@ def main():
         # 3. Optimize PL2
         # -----------------------------------------------
         print(f"\n--- Optimizing PL2 ({len(pl2_configs)} configs) ---")
-        pl2_results = run_grid_search(index_path, topics, qrels, "PL2", pl2_configs, target_metric, f"PL2 Grid ({dataset})")
+        pl2_results = run_grid_search(index, topics, qrels, "PL2", pl2_configs, target_metric, f"PL2 Grid ({dataset})")
         
         df_pl2 = pd.DataFrame(pl2_results)
         if df_pl2['score'].max() < 0:
@@ -282,7 +301,7 @@ def main():
         current_best_pl2["c"] = local_best_pl2["c"]
 
         # Save Best Run
-        best_pl2_model = pt.terrier.Retriever(main_index, wmodel="PL2", controls={"c": local_best_pl2['c']})
+        best_pl2_model = pt.terrier.Retriever(index, wmodel="PL2", controls={"c": local_best_pl2['c']})
         save_trec_run(best_pl2_model, topics, run_dir, 
                       f"{dataset}_BEST_pl2_c-{local_best_pl2['c']:.2f}.run")
 
