@@ -185,7 +185,12 @@ def main():
 
     # Load index once - will be shared across threads
     print(f"Loading index from: {index_path}")
-    index = pt.IndexFactory.of(index_path)
+    
+    index = pt.IndexFactory.of(
+        index_path, 
+        properties={"index.meta.data-source": "fileinmem"}
+    )
+
     print(f"Index loaded: {index.getCollectionStatistics().getNumberOfDocuments()} documents")
 
     run_dir = env['paths']['sparse_run_directory']
