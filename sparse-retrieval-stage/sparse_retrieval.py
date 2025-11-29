@@ -18,7 +18,7 @@ if not pt.java.started():
 # CONFIGURATION
 # ==========================================
 # The order of datasets to fine-tune on
-DATASET_SEQUENCE = ["train", "dev1", "dev2", "dev3"]
+DATASET_SEQUENCE = ["train", "dev1", "dev2"]#, "dev3"]
 
 # 1. Global Grid (Used for the first dataset to find rough area)
 GLOBAL_BM25_GRID = {
