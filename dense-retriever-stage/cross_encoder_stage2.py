@@ -31,7 +31,10 @@ print(f"Hardware Detected: {NUM_GPUS} GPUs available.")
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
+# Local Model Directory
+LOCAL_MODEL_DIR = "/media/12TB/shared/models"
 MODEL_NAME = "castorini/monot5-large-msmarco-10k"
+LOCAL_MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "monot5-large-msmarco")
 BATCH_SIZE = 64 # Per GPU (Total ~128) - T5 Large is VRAM hungry
 
 # Candidate Depth Tuning
@@ -50,7 +53,7 @@ ALPHA = 0.5 # Robustness parameter
 
 def load_env(env_path="env.json"):
     if not os.path.exists(env_path):
-        env_path = "/content/env.json"
+        env_path = "../env.json"
     with open(env_path, 'r') as f:
         return json.load(f)
 
@@ -62,6 +65,36 @@ def get_paths(env):
         "output_run": os.path.join(env['dense-retrieval']['dense_run_files'], "cross_encoder"),
         "output_eval": os.path.join(env['dense-retrieval']['dense_eval_files'], "cross_encoder")
     }
+
+def load_queries(env, dataset, query_variant="mistral"):
+    """Load queries for a dataset from query files."""
+    # Map dataset names to file patterns
+    dataset_map = {
+        "train": "train",
+        "dev1": "dev-1", 
+        "dev2": "dev-2",
+        "dev3": "dev-3",
+        "test": "test"
+    }
+    
+    dataset_file = dataset_map.get(dataset, dataset)
+    query_path = f"./rewritten-queries/{query_variant}_{dataset_file}_rewritten_queries.jsonl"
+    
+    if not os.path.exists(query_path):
+        raise FileNotFoundError(f"Query file not found: {query_path}")
+    
+    queries_df = pd.read_json(query_path, lines=True)
+    
+    # Normalize column names
+    if 'query_id' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'query_id': 'qid'})
+    if 'text' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'text': 'query'})
+    
+    # Ensure qid is string type for merging
+    queries_df['qid'] = queries_df['qid'].astype(str)
+    
+    return queries_df[['qid', 'query']]
 
 class MonoT5Dataset(Dataset):
     def __init__(self, queries, docs, tokenizer):
@@ -78,13 +111,15 @@ class MonoT5Dataset(Dataset):
         return text
 
 class MonoT5Scorer:
-    def __init__(self, model_name, batch_size):
+    def __init__(self, model_name, local_path, batch_size):
         self.model_name = model_name
         self.batch_size = batch_size * max(1, NUM_GPUS)
         
-        print(f"Loading {self.model_name}...")
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
-        self.model = T5ForConditionalGeneration.from_pretrained(model_name)
+        # Try local path first, fallback to HF hub
+        model_path = local_path if os.path.exists(local_path) else model_name
+        print(f"Loading MonoT5 from {model_path}...")
+        self.tokenizer = T5Tokenizer.from_pretrained(model_path)
+        self.model = T5ForConditionalGeneration.from_pretrained(model_path)
         
         # Token IDs for "true" and "false"
         self.true_token = self.tokenizer.encode("true")[0]
@@ -133,7 +168,8 @@ class MonoT5Scorer:
                 outputs = self.model(
                     input_ids=inputs.input_ids,
                     attention_mask=inputs.attention_mask,
-                    decoder_input_ids=decoder_input_ids
+                    decoder_input_ids=decoder_input_ids,
+                    use_cache=False  # Disable cache to avoid compatibility issues
                 )
                 
                 logits = outputs.logits[:, 0, :] # First token logits [Batch, Vocab]
@@ -197,7 +233,7 @@ def main():
     print(f"Selected Input Run Type: {input_prefix}")
 
     # 2. Initialize Scorer
-    scorer = MonoT5Scorer(MODEL_NAME, BATCH_SIZE)
+    scorer = MonoT5Scorer(MODEL_NAME, LOCAL_MODEL_PATH, BATCH_SIZE)
     
     tuning_matrix = {k: [] for k in K_GRID} # For nDCG robustness
     metrics_log = []
@@ -220,6 +256,14 @@ def main():
             continue
             
         dense_run = pt.io.read_results(run_path)
+        
+        # Load Queries
+        print("  Loading queries...")
+        queries_df = load_queries(env, dataset)
+        
+        # Merge queries with dense run
+        dense_run['qid'] = dense_run['qid'].astype(str)
+        dense_run = dense_run.merge(queries_df, on='qid', how='left')
         
         # Filter to Max K (300)
         dense_run = dense_run.sort_values(["qid", "score"], ascending=[True, False])
