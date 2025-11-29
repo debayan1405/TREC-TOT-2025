@@ -31,19 +31,25 @@ print(f"Hardware Detected: {NUM_GPUS} GPUs available.")
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
+# Local Model Directory
+LOCAL_MODEL_DIR = "/media/12TB/shared/models"
+
 MODELS_CONFIG = {
     "colbertv2.0": {
         "hf_id": "colbert-ir/colbertv2.0",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "colbertv2.0"),
         "type": "colbert",
         "batch_size": 128  # Per GPU
     },
     "contriever": {
         "hf_id": "facebook/contriever",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "contriever"),
         "type": "dot_product",
         "batch_size": 256
     },
     "e5-large": {
         "hf_id": "intfloat/e5-large",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "e5-large"),
         "type": "e5", # Requires specific prefixing
         "batch_size": 128
     }
@@ -69,7 +75,7 @@ ALPHA = 0.5
 
 def load_env(env_path="env.json"):
     if not os.path.exists(env_path):
-        env_path = "/content/env.json" # Fallback
+        env_path = "../env.json" # Fallback
     with open(env_path, 'r') as f:
         return json.load(f)
 
@@ -81,6 +87,36 @@ def get_paths(env):
         "output_eval": env['dense-retrieval']['dense_eval_files'],
         "fusion_dir": env['paths']['fusion_run_directory']
     }
+
+def load_queries(env, dataset, query_variant="mistral"):
+    """Load queries for a dataset from query files."""
+    # Map dataset names to file patterns
+    dataset_map = {
+        "train": "train",
+        "dev1": "dev-1", 
+        "dev2": "dev-2",
+        "dev3": "dev-3",
+        "test": "test"
+    }
+    
+    dataset_file = dataset_map.get(dataset, dataset)
+    query_path = f"./rewritten-queries/{query_variant}_{dataset_file}_rewritten_queries.jsonl"
+    
+    if not os.path.exists(query_path):
+        raise FileNotFoundError(f"Query file not found: {query_path}")
+    
+    queries_df = pd.read_json(query_path, lines=True)
+    
+    # Normalize column names
+    if 'query_id' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'query_id': 'qid'})
+    if 'text' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'text': 'query'})
+    
+    # Ensure qid is string type for merging
+    queries_df['qid'] = queries_df['qid'].astype(str)
+    
+    return queries_df[['qid', 'query']]
 
 class ReRankDataset(Dataset):
     def __init__(self, queries, docs, tokenizer, max_len=512, model_type="dot_product"):
@@ -109,12 +145,15 @@ class BiEncoderScorer:
         self.model_name = model_key
         self.config = config
         self.hf_id = config['hf_id']
+        self.local_path = config.get('local_path', self.hf_id)
         self.type = config['type']
         self.batch_size = config['batch_size'] * max(1, NUM_GPUS)
         
-        print(f"Loading {self.model_name} ({self.hf_id})...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.hf_id)
-        self.model = AutoModel.from_pretrained(self.hf_id)
+        # Try local path first, fallback to HF hub
+        model_path = self.local_path if os.path.exists(self.local_path) else self.hf_id
+        print(f"Loading {self.model_name} from {model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModel.from_pretrained(model_path)
         
         if NUM_GPUS > 1:
             print(f"Wrapping model in DataParallel for {NUM_GPUS} GPUs")
@@ -248,6 +287,14 @@ def main():
                 continue
                 
             sparse_run = pt.io.read_results(run_path)
+            
+            # Load Queries
+            print("  Loading queries...")
+            queries_df = load_queries(env, dataset)
+            
+            # Merge queries with sparse run
+            sparse_run['qid'] = sparse_run['qid'].astype(str)
+            sparse_run = sparse_run.merge(queries_df, on='qid', how='left')
             
             # Filter to Top-5000
             sparse_run = sparse_run.sort_values(["qid", "score"], ascending=[True, False])
