@@ -1,0 +1,11 @@
+rewriter,model,params,dev3_path,ndcg_10,success_10
+llama,BM25,"{'k1': 0.01, 'b': 0.6}",/content/sparse_run_files/llama-query-run-files/llama_dev3_BEST_bm25_k1-0.01_b-0.60.run,0.388941955,0.501865672
+llama,PL2,{'c': 3.5},/content/sparse_run_files/llama-query-run-files/llama_dev3_BEST_pl2_c-3.50.run,0.375967331,0.472014925
+mistral,BM25,"{'k1': 0.01, 'b': 0.55}",/content/sparse_run_files/mistral-query-run-files/mistral_dev3_BEST_bm25_k1-0.01_b-0.55.run,0.46085448,0.567164179
+mistral,PL2,{'c': 2.5},/content/sparse_run_files/mistral-query-run-files/mistral_dev3_BEST_pl2_c-2.50.run,0.429858024,0.529850746
+qwen,BM25,"{'k1': 0.01, 'b': 0.85}",/content/sparse_run_files/qwen-query-run-files/qwen_dev3_BEST_bm25_k1-0.01_b-0.85.run,0.371975807,0.479477612
+qwen,PL2,{'c': 2.5},/content/sparse_run_files/qwen-query-run-files/qwen_dev3_BEST_pl2_c-2.50.run,0.394461667,0.483208955
+summarized,BM25,"{'k1': 0.01, 'b': 0.55}",/content/sparse_run_files/summarized-query-run-files/summarized_dev3_BEST_bm25_k1-0.01_b-0.55.run,0.440633901,0.567164179
+summarized,PL2,{'c': 3.5},/content/sparse_run_files/summarized-query-run-files/summarized_dev3_BEST_pl2_c-3.50.run,0.422162084,0.542910448
+original,BM25,"{'k1': 0.01, 'b': 0.75}",/content/sparse_run_files/original-query-run-files/original_query_dev3_BEST_bm25_k1-0.01_b-0.75.run,0.336589698,0.434701493
+original,PL2,{'c': 1.76},/content/sparse_run_files/original-query-run-files/original_query_dev3_BEST_pl2_c-1.76.run,0.284386305,0.378731343

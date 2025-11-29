@@ -1,7 +1,0 @@
-dataset,model,k1,b,param_c,metric,value
-train,BM25,0.4,0.8,,ndcg_cut_10,0.07994006361760307
-train,PL2,,,2.5,ndcg_cut_10,0.06322788441142263
-dev1,BM25,0.01,0.8,,ndcg_cut_10,0.06755571725174593
-dev1,PL2,,,2.5,ndcg_cut_10,0.05723463141645563
-dev2,BM25,0.01,0.6,,ndcg_cut_10,0.06832551835830641
-dev2,PL2,,,3.5,ndcg_cut_10,0.06892392511445047
