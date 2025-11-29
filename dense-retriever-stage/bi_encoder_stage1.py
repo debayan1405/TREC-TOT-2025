@@ -52,9 +52,16 @@ MODELS_CONFIG = {
 K_GRID = [500, 1000, 1500, 2000, 2500, 3000, 3500, 4000, 4500, 5000]
 MAX_K = 5000 # We infer on this many, then filter
 
-DATASETS = ["train", "dev1", "dev2", "dev3"]
+# Datasets used for Robust Tuning
+TUNING_DATASETS = ["train", "dev1", "dev2"]
+TEST_DATASET = "dev3"
+ALL_DATASETS = TUNING_DATASETS + [TEST_DATASET]
 
 MEASURES = [nDCG@10, nDCG@100, R@1000, P@10, RR, Success@10]
+
+# Robustness Parameter (Alpha)
+# Score = Mean - Alpha * Std
+ALPHA = 0.5 
 
 # ==========================================
 # 3. HELPERS & MODEL CLASSES
@@ -132,35 +139,24 @@ class BiEncoderScorer:
 
         with torch.no_grad():
             for q_batch, d_batch in tqdm(loader, desc=f"Scoring {self.model_name}", leave=False):
-                # Tokenize on main process to avoid pickling overhead issues in DP
-                # For optimal speed, tokenization should ideally be inside the loop or dataset
-                # Here we do it per batch to keep memory low
-                
-                # Encode Queries
+                # Tokenize
                 q_inputs = self.tokenizer(list(q_batch), padding=True, truncation=True, max_length=128, return_tensors='pt').to(DEVICE)
                 d_inputs = self.tokenizer(list(d_batch), padding=True, truncation=True, max_length=256, return_tensors='pt').to(DEVICE)
 
                 if self.type == "colbert":
                     # ColBERT Interaction (MaxSim)
-                    # We manually handle ColBERT scoring to avoid dependency hell
-                    # Q: [B, Lq, D], D: [B, Ld, D]
-                    
-                    q_out = self.model(**q_inputs)[0] # last_hidden_state
+                    q_out = self.model(**q_inputs)[0] 
                     d_out = self.model(**d_inputs)[0]
                     
-                    # Normalize (ColBERT uses L2 norm usually, or dot product if pre-normed)
-                    # Standard ColBERT v2 checks:
                     q_out = torch.nn.functional.normalize(q_out, p=2, dim=2)
                     d_out = torch.nn.functional.normalize(d_out, p=2, dim=2)
 
-                    # MaxSim: For every Q token, find max sim in D tokens, then sum
-                    # Similarity matrix: [B, Lq, Ld]
                     sim_matrix = torch.bmm(q_out, d_out.transpose(1, 2))
-                    max_sim_values, _ = torch.max(sim_matrix, dim=2) # [B, Lq]
-                    scores = torch.sum(max_sim_values, dim=1) # [B]
+                    max_sim_values, _ = torch.max(sim_matrix, dim=2) 
+                    scores = torch.sum(max_sim_values, dim=1) 
                     
                 else:
-                    # Dot Product Models (Contriever, E5)
+                    # Dot Product Models
                     q_out = self.model(**q_inputs)[0]
                     d_out = self.model(**d_inputs)[0]
                     
@@ -179,18 +175,6 @@ class BiEncoderScorer:
 # ==========================================
 # 4. MAIN PIPELINE
 # ==========================================
-
-def get_text_mapping(index, docids):
-    """
-    Fetches text for a list of DocIDs using PyTerrier MetaIndex.
-    """
-    # Unique docs to save lookup time
-    unique_docids = list(set(docids))
-    # PyTerrier text retrieval
-    # docids must be integers (internal IDs) or strings (external docnos)?
-    # pt.text.get_text uses docnos usually if input is dataframe
-    pass 
-    # Logic moved to main loop to use pt.text.get_text transformer
 
 def pandas_rrf(df_list, k=60):
     fused_parts = []
@@ -217,11 +201,13 @@ def main():
     bi_encoder_eval_dir = os.path.join(paths['output_eval'], "bi_encoder")
     os.makedirs(bi_encoder_eval_dir, exist_ok=True)
     
-    # Load Index
+    # Directory for Master 5k Files (Backup)
+    full_5k_dir = os.path.join(paths['output_run'], "full_5k")
+    os.makedirs(full_5k_dir, exist_ok=True)
+    
     print("Loading Index...")
     index = pt.IndexFactory.of(paths['index'])
     
-    # Qrels lookup
     def get_qrels(ds):
         key_map = {
             "train": "train_qrels_path", "dev1": "dev1_qrels_path",
@@ -230,11 +216,10 @@ def main():
         return pt.io.read_qrels(env['paths'][key_map[ds]])
 
     # -----------------------------------------------
-    # PHASE 1: GENERATE DENSE SCORES (For all datasets & models)
+    # PHASE 1: GENERATE DENSE SCORES & TUNE K
     # -----------------------------------------------
     
-    # Store paths to final best run files for Phase 2 (Fusion)
-    final_dense_runs = {ds: {} for ds in DATASETS} # {train: {colbert: path, ...}}
+    final_dense_runs = {ds: {} for ds in ALL_DATASETS} 
 
     for model_name, config in MODELS_CONFIG.items():
         print(f"\n{'#'*60}")
@@ -243,15 +228,20 @@ def main():
         
         scorer = BiEncoderScorer(model_name, config)
         
+        # We store recall matrices to perform Robust K selection
+        # Format: { k_value: [recall_train, recall_dev1, recall_dev2] }
+        tuning_matrix = {k: [] for k in K_GRID}
+        
+        # Store Master Dataframes in memory to avoid re-loading for final generation
+        master_dfs = {} 
+        
         metrics_log = []
 
-        # Optimal K tracking
-        best_k_global = 1000 # Default
-        
-        for dataset in DATASETS:
+        # 1. Inference & Virtual Sweep on Tuning Sets
+        for dataset in ALL_DATASETS:
             print(f"\n>>> Dataset: {dataset}")
             
-            # 1. Load Sparse Run (Standardized names expected: train.run, dev1.run...)
+            # Load Sparse Run
             run_path = os.path.join(paths['input'], f"{dataset}.run")
             if not os.path.exists(run_path):
                 print(f"  [ERR] Run file not found: {run_path}")
@@ -259,20 +249,17 @@ def main():
                 
             sparse_run = pt.io.read_results(run_path)
             
-            # 2. Filter to Top-5000 (Max Candidate Set)
-            # Efficient: sort and head
-            # But pt results are usually not sorted by rank in dataframe? Safe to sort.
+            # Filter to Top-5000
             sparse_run = sparse_run.sort_values(["qid", "score"], ascending=[True, False])
             sparse_run["rank"] = sparse_run.groupby("qid").cumcount() + 1
             candidates = sparse_run[sparse_run["rank"] <= MAX_K].copy()
             
-            # 3. Fetch Text
+            # Fetch Text
             print("  Fetching text...")
-            # Use PyTerrier transformer for efficiency
             text_pipeline = pt.text.get_text(index, "text")
             candidates_with_text = text_pipeline.transform(candidates)
             
-            # 4. Score
+            # Score
             print("  Re-ranking...")
             dense_scores = scorer.score(
                 candidates_with_text["query"].tolist(), 
@@ -282,64 +269,96 @@ def main():
             # Create Master Dense DataFrame
             master_dense = candidates_with_text.copy()
             master_dense["score"] = dense_scores
-            # Preserve sparse rank for K-filtering logic
             master_dense = master_dense.rename(columns={"rank": "sparse_rank"}) 
             
-            # 5. Virtual K Tuning
-            qrels = get_qrels(dataset)
-            formatted_qrels = qrels.rename(columns={"qid":"query_id", "docno":"doc_id", "label":"relevance"})
+            # [CRITICAL] Save Full 5k List for Offline Analysis
+            master_fname = f"{model_name}_{dataset}_FULL_5k.run"
+            master_path = os.path.join(full_5k_dir, master_fname)
             
-            best_k_dataset = 500
-            best_recall_dataset = -1.0
+            master_save = master_dense.sort_values(["qid", "score"], ascending=[True, False])
+            master_save["rank"] = master_save.groupby("qid").cumcount() + 1
+            master_save["Q0"] = "Q0"
+            master_save["system"] = f"{model_name}_dense_5k"
             
-            # Only tune/log metrics if not dev3 (Dev3 is blind test)
-            if dataset != "dev3":
-                print("  Tuning K (Virtual Sweep)...")
+            pt.io.write_results(master_save, master_path)
+            print(f"  Saved Backup 5k Run: {master_fname}")
+            
+            # Store in memory for later use (avoid re-read)
+            master_dfs[dataset] = master_dense
+
+            # Virtual K Tuning (Only on Tuning Sets)
+            if dataset in TUNING_DATASETS:
+                qrels = get_qrels(dataset)
+                formatted_qrels = qrels.rename(columns={"qid":"query_id", "docno":"doc_id", "label":"relevance"})
+                
+                print("  Virtual Sweep (Collecting Recall Stats)...")
                 for k in K_GRID:
                     # Filter: Keep docs that were in the top K of the SPARSE list
-                    # This simulates if we had only sent K docs to the re-ranker
                     subset = master_dense[master_dense["sparse_rank"] <= k].copy()
                     
-                    # Now rank this subset by DENSE score
+                    # Evaluate Recall (R@1000 is usually equivalent to coverage for ToT)
+                    # We use R@1000 as the proxy for "Recall@K" since we are re-ranking 
+                    # whatever survived the K cut.
                     subset = subset.sort_values(["qid", "score"], ascending=[True, False])
-                    subset["rank"] = subset.groupby("qid").cumcount() + 1
-                    
-                    # Evaluate
                     formatted_res = subset.rename(columns={"qid":"query_id", "docno":"doc_id"})
-                    res_metrics = calc_aggregate(MEASURES, formatted_qrels, formatted_res)
                     
-                    # Log
-                    rec_val = res_metrics.get(R@1000, 0)
-                    ndcg_val = res_metrics.get(nDCG@10, 0)
+                    # Compute just Recall for speed in loop
+                    # Using ir_measures
+                    m = calc_aggregate([R@1000], formatted_qrels, formatted_res)
+                    recall_val = m.get(R@1000, 0)
+                    
+                    # Store for aggregation
+                    tuning_matrix[k].append(recall_val)
                     
                     metrics_log.append({
                         "model": model_name,
                         "dataset": dataset,
                         "k": k,
-                        "R@1000": rec_val,
-                        "nDCG@10": ndcg_val,
-                        "P@10": res_metrics.get(P@10, 0),
-                        "Success@10": res_metrics.get(Success@10, 0)
+                        "R@1000": recall_val
                     })
-                    
-                    if rec_val > best_recall_dataset:
-                        best_recall_dataset = rec_val
-                        best_k_dataset = k
-                
-                print(f"  Best K (Recall) for {dataset}: {best_k_dataset}")
-                
-                # Update Global Decision: For simplicity, we use Train's best K for downstream
-                if dataset == "train":
-                    best_k_global = best_k_dataset
+
+        # 2. Robust K Selection
+        print(f"\n>>> Robust K Selection ({model_name})")
+        print(f"    Strategy: Maximize (Mean_Recall - {ALPHA} * Std_Dev)")
+        
+        best_k_robust = 1000
+        best_robust_score = -1.0
+        
+        selection_log = []
+        
+        for k in K_GRID:
+            recalls = tuning_matrix[k]
+            if not recalls: continue
             
-            else:
-                # For Dev3, we just use the determined Global Best K
-                print(f"  Applying Train-Optimal K={best_k_global} to Dev3...")
+            mean_r = np.mean(recalls)
+            std_r = np.std(recalls)
+            robust_score = mean_r - (ALPHA * std_r)
             
-            # 6. Generate FINAL Run File for this Dataset (Using Best K Global)
-            # Note: For Dev1/Dev2, we also save the run using the Train-determined K 
-            # to be consistent with a real pipeline flow.
-            final_subset = master_dense[master_dense["sparse_rank"] <= best_k_global].copy()
+            selection_log.append({
+                "k": k, "mean": mean_r, "std": std_r, "score": robust_score
+            })
+            
+            if robust_score > best_robust_score:
+                best_robust_score = robust_score
+                best_k_robust = k
+                
+        print(f"    Winner: K={best_k_robust} (Score: {best_robust_score:.4f})")
+        
+        # Save Selection Log
+        pd.DataFrame(selection_log).to_csv(
+            os.path.join(bi_encoder_eval_dir, f"{model_name}_robust_selection.csv"), index=False
+        )
+
+        # 3. Generate Final Run Files (Using Robust K)
+        print(f"\n>>> Generating Final Run Files (K={best_k_robust})...")
+        
+        for dataset in ALL_DATASETS:
+            # Retrieve from memory
+            if dataset not in master_dfs: continue
+            master_dense = master_dfs[dataset]
+            
+            # Apply Robust K Cut
+            final_subset = master_dense[master_dense["sparse_rank"] <= best_k_robust].copy()
             final_subset = final_subset.sort_values(["qid", "score"], ascending=[True, False])
             final_subset["rank"] = final_subset.groupby("qid").cumcount() + 1
             final_subset["Q0"] = "Q0"
@@ -350,29 +369,25 @@ def main():
             fpath = os.path.join(paths['output_run'], fname)
             pt.io.write_results(final_subset, fpath)
             final_dense_runs[dataset][model_name] = fpath
-            print(f"  Saved Final Run: {fname}")
-
-        # Save Metrics Log for this Model
-        if metrics_log:
-            df_log = pd.DataFrame(metrics_log)
-            csv_name = f"{model_name}_tuning.csv"
-            df_log.to_csv(os.path.join(bi_encoder_eval_dir, csv_name), index=False)
+            print(f"  {dataset}: Saved {fname}")
             
-            # Plotting
-            plt.figure(figsize=(10, 6))
-            sns.lineplot(data=df_log, x="k", y="R@1000", hue="dataset", marker="o")
-            plt.title(f"{model_name}: Recall@1000 vs Candidate K")
-            plt.grid(True)
-            plt.savefig(os.path.join(bi_encoder_eval_dir, f"{model_name}_recall_curve.png"))
-            plt.close()
+            # Full Evaluation for this final run
+            qrels = get_qrels(dataset)
+            q_std = qrels.rename(columns={"qid":"query_id", "docno":"doc_id", "label":"relevance"})
+            r_std = final_subset.rename(columns={"qid":"query_id", "docno":"doc_id"})
+            
+            final_metrics = calc_aggregate(MEASURES, q_std, r_std)
+            
+            # Append to main log (optional, or just save separate summary)
+            # We will rely on the fusion step summary for comparison
 
-        # Clear GPU Memory between models
+        # Cleanup
         del scorer
         torch.cuda.empty_cache()
         gc.collect()
 
     # -----------------------------------------------
-    # PHASE 2: RRF FUSION OF DENSE MODELS
+    # PHASE 2: RRF FUSION
     # -----------------------------------------------
     print(f"\n{'#'*60}")
     print(f"DENSE FUSION (RRF)")
@@ -380,7 +395,7 @@ def main():
     
     fusion_log = []
     
-    for dataset in DATASETS:
+    for dataset in ALL_DATASETS:
         runs_map = final_dense_runs[dataset]
         if len(runs_map) < 3:
             print(f"Skipping fusion for {dataset}, incomplete runs.")
@@ -388,28 +403,21 @@ def main():
             
         print(f"Fusing {dataset}...")
         
-        # Load the 3 dense runs
         dfs = []
         for m_name, path in runs_map.items():
             dfs.append(pt.io.read_results(path))
         
-        # Fuse
         fused_res = pandas_rrf(dfs, k=60)
         
-        # Evaluate Fusion
         qrels = get_qrels(dataset)
-        formatted_qrels = qrels.rename(columns={"qid":"query_id", "docno":"doc_id", "label":"relevance"})
-        formatted_res = fused_res.rename(columns={"qid":"query_id", "docno":"doc_id"})
+        q_std = qrels.rename(columns={"qid":"query_id", "docno":"doc_id", "label":"relevance"})
+        r_std = fused_res.rename(columns={"qid":"query_id", "docno":"doc_id"})
         
-        metrics = calc_aggregate(MEASURES, formatted_qrels, formatted_res)
+        metrics = calc_aggregate(MEASURES, q_std, r_std)
         
-        # Save Fused Run
         fused_path = os.path.join(paths['output_run'], f"dense_fusion_{dataset}.run")
         pt.io.write_results(fused_res, fused_path)
         
-        # Log comparison logic (vs Best Single Dense)
-        # For brevity, we just log the Fusion Score here. 
-        # A separate analysis script can compare vs single models if needed.
         record = {
             "dataset": dataset,
             "system": "RRF_Dense_Fusion",
@@ -420,7 +428,6 @@ def main():
         fusion_log.append(record)
         print(f"  Fusion Score nDCG@10: {record['nDCG@10']:.4f}")
 
-    # Save Fusion Log
     pd.DataFrame(fusion_log).to_csv(os.path.join(bi_encoder_eval_dir, "dense_fusion_results.csv"), index=False)
     print("\nDense Pipeline Complete.")
 
