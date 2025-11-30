@@ -27,11 +27,14 @@ print(f"Hardware: {NUM_GPUS} GPUs")
 # ==========================================
 # 2. CONFIGURATION
 # ==========================================
+# Local Model Directory
+LOCAL_MODEL_DIR = "/media/12TB/shared/models"
 MODEL_NAME = "Qwen/Qwen2.5-72B-Instruct-AWQ"
+LOCAL_MODEL_PATH = os.path.join(LOCAL_MODEL_DIR, "qwen2.5-72b-awq")
 
 # Tuning Grids (Virtual)
-K_CROSS_GRID = [100, 150, 200, 300] # Simulated input depths
-K_LLM_GRID = [10, 15, 20, 25, 30, 50] # LLM Re-ranking depths
+K_CROSS_GRID = [30, 50, 100, 150] # Adjusted based on CE tuning results
+K_LLM_GRID = [10, 15, 20, 25] # LLM Re-ranking depths
 MAX_LLM_K = 50 # We re-rank this many, then simulate smaller K
 
 DATASETS = ["train", "dev1", "dev2", "dev3"]
@@ -66,30 +69,35 @@ Ranking:"""
 # ==========================================
 
 class QwenRanker:
-    def __init__(self, model_name):
+    def __init__(self, model_name, local_path):
         self.model_name = model_name
-        print(f"Loading {model_name}...")
+        
+        # Try local path first, fallback to HF hub
+        model_path = local_path if os.path.exists(local_path) else model_name
+        print(f"Loading Qwen from {model_path}...")
         
         # Load with auto device map to spread across 2x 48GB GPUs
-        # AWQ usually requires auto_gptq or bitsandbytes
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
+                model_path,
                 device_map="auto",
                 torch_dtype=torch.float16,
                 trust_remote_code=True
             )
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        except OSError:
-            print(f"[ERR] Model not found locally. Downloading from HF: {model_name}")
-            # HF Token might be needed if gated, but Qwen usually isn't.
-            # Assuming env has token if needed.
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                torch_dtype=torch.float16
-            )
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        except Exception as e:
+            print(f"[ERR] Failed to load from {model_path}: {e}")
+            if model_path != model_name:
+                print(f"Falling back to HF hub: {model_name}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    device_map="auto",
+                    torch_dtype=torch.float16,
+                    trust_remote_code=True
+                )
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+            else:
+                raise
 
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
@@ -119,15 +127,20 @@ class QwenRanker:
             messages, tokenize=False, add_generation_prompt=True
         )
         
-        inputs = self.tokenizer([text_input], return_tensors="pt").to(self.model.device)
+        inputs = self.tokenizer([text_input], return_tensors="pt", padding=True).to(self.model.device)
+        
+        # Set attention mask to fix the warning
+        if inputs.attention_mask is None:
+            inputs['attention_mask'] = torch.ones_like(inputs.input_ids)
 
         # Generate
         with torch.no_grad():
             generated_ids = self.model.generate(
                 inputs.input_ids,
+                attention_mask=inputs.attention_mask,
                 max_new_tokens=128,
-                temperature=0.01, # Near deterministic
-                do_sample=False
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id
             )
             
         generated_ids = [
@@ -169,7 +182,7 @@ class QwenRanker:
 # ==========================================
 
 def load_env(env_path="env.json"):
-    if not os.path.exists(env_path): env_path = "/content/env.json"
+    if not os.path.exists(env_path): env_path = "../env.json"
     with open(env_path, 'r') as f: return json.load(f)
 
 def get_paths(env):
@@ -179,6 +192,36 @@ def get_paths(env):
         "output_run": os.path.join(env['dense-retrieval']['dense_run_files'], "llm_reranker"),
         "output_eval": os.path.join(env['dense-retrieval']['dense_eval_files'], "llm_reranker")
     }
+
+def load_queries(env, dataset, query_variant="mistral"):
+    """Load queries for a dataset from query files."""
+    # Map dataset names to file patterns
+    dataset_map = {
+        "train": "train",
+        "dev1": "dev-1", 
+        "dev2": "dev-2",
+        "dev3": "dev-3",
+        "test": "test"
+    }
+    
+    dataset_file = dataset_map.get(dataset, dataset)
+    query_path = f"./rewritten-queries/{query_variant}_{dataset_file}_rewritten_queries.jsonl"
+    
+    if not os.path.exists(query_path):
+        raise FileNotFoundError(f"Query file not found: {query_path}")
+    
+    queries_df = pd.read_json(query_path, lines=True)
+    
+    # Normalize column names
+    if 'query_id' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'query_id': 'qid'})
+    if 'text' in queries_df.columns:
+        queries_df = queries_df.rename(columns={'text': 'query'})
+    
+    # Ensure qid is string type for merging
+    queries_df['qid'] = queries_df['qid'].astype(str)
+    
+    return queries_df[['qid', 'query']]
 
 def main():
     env = load_env()
@@ -191,9 +234,7 @@ def main():
     index = pt.IndexFactory.of(paths['index'])
     
     # 1. Initialize Model
-    # Explicit check for model existence not fully needed if transformers handles it, 
-    # but we assume it's downloaded as per prompt.
-    ranker = QwenRanker(MODEL_NAME)
+    ranker = QwenRanker(MODEL_NAME, LOCAL_MODEL_PATH)
     
     def get_qrels(ds):
         key_map = {"train": "train_qrels_path", "dev1": "dev1_qrels_path", "dev2": "dev2_qrels_path", "dev3": "dev3_qrels_path"}
@@ -224,18 +265,13 @@ def main():
             
         ce_run = pt.io.read_results(run_path)
         
-        # We need query text. In ce_run dataframe? No, typically just qid/docno/score.
-        # We need to fetch query text again from files or index?
-        # Sparse stage filtered out query text. Let's reload queries.
-        q_key = "mistral" # Winner
-        q_path = env['paths']['query_variations'][q_key][dataset]
-        queries_df = pd.read_json(q_path, lines=True)
-        if 'query_id' in queries_df.columns: queries_df = queries_df.rename(columns={'query_id': 'qid'})
-        if 'text' in queries_df.columns: queries_df = queries_df.rename(columns={'text': 'query'})
-        queries_df['qid'] = queries_df['qid'].astype(str)
+        # Load queries using the helper function
+        print("  Loading queries...")
+        queries_df = load_queries(env, dataset)
         
         # Merge Query Text
-        ce_run = ce_run.merge(queries_df[['qid', 'query']], on='qid', how='left')
+        ce_run['qid'] = ce_run['qid'].astype(str)
+        ce_run = ce_run.merge(queries_df, on='qid', how='left')
         
         # Fetch Doc Text
         print("  Fetching doc text...")
