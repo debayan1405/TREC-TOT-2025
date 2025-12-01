@@ -27,19 +27,38 @@ NUM_GPUS = torch.cuda.device_count()
 print(f"Hardware: {NUM_GPUS} GPUs detected.")
 
 # --- PARAMETERS ---
+# Local Model Directory
+LOCAL_MODEL_DIR = "/media/12TB/shared/models"
+
 # Stage 1: Sparse
 BM25_PARAMS = {'c': 0.01, 'bm25.b': 0.55}
 
 # Stage 2: Dense
 DENSE_MODELS = {
-    "colbertv2.0": {"hf_id": "colbert-ir/colbertv2.0", "type": "colbert", "batch": 128},
-    "contriever": {"hf_id": "facebook/contriever", "type": "dot", "batch": 256},
-    "e5-large": {"hf_id": "intfloat/e5-large", "type": "e5", "batch": 128}
+    "colbertv2.0": {
+        "hf_id": "colbert-ir/colbertv2.0",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "colbertv2.0"),
+        "type": "colbert",
+        "batch": 128
+    },
+    "contriever": {
+        "hf_id": "facebook/contriever",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "contriever"),
+        "type": "dot",
+        "batch": 256
+    },
+    "e5-large": {
+        "hf_id": "intfloat/e5-large",
+        "local_path": os.path.join(LOCAL_MODEL_DIR, "e5-large"),
+        "type": "e5",
+        "batch": 128
+    }
 }
 K_DENSE_INPUT = 1000 # Retrieve top 1000 from sparse
 
 # Stage 3: Cross-Encoder
 CE_MODEL = "castorini/monot5-large-msmarco-10k"
+CE_LOCAL_PATH = os.path.join(LOCAL_MODEL_DIR, "monot5-large-msmarco")
 CE_BATCH = 64
 K_CE_POOL_SPARSE = 100 # Take top 100 from BM25
 K_CE_POOL_DENSE = 100  # Take top 100 from Dense Fusion
@@ -47,6 +66,7 @@ K_CE_POOL_DENSE = 100  # Take top 100 from Dense Fusion
 
 # Stage 4: LLM
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct-AWQ"
+LLM_LOCAL_PATH = os.path.join(LOCAL_MODEL_DIR, "qwen2.5-72b-awq")
 K_LLM_INPUT = 30 # Input to LLM
 LLM_CONTEXT_CHARS = 500 # Increased context window
 
@@ -75,9 +95,15 @@ class DenseScorer:
     def __init__(self, config):
         self.type = config['type']
         self.batch_size = config['batch'] * max(1, NUM_GPUS)
-        print(f"Loading {config['hf_id']}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(config['hf_id'])
-        self.model = AutoModel.from_pretrained(config['hf_id']).to(DEVICE).eval()
+        
+        # Try local path first, fallback to HF hub
+        model_path = config.get('local_path', config['hf_id'])
+        if not os.path.exists(model_path):
+            model_path = config['hf_id']
+        
+        print(f"Loading {config['hf_id']} from {model_path}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.model = AutoModel.from_pretrained(model_path).to(DEVICE).eval()
         if NUM_GPUS > 1: self.model = nn.DataParallel(self.model)
 
     def mean_pooling(self, token_embeddings, attention_mask):
@@ -107,10 +133,12 @@ class DenseScorer:
         return np.concatenate(all_scores)
 
 class MonoT5Scorer:
-    def __init__(self, model_name):
-        print(f"Loading {model_name}...")
-        self.tokenizer = T5Tokenizer.from_pretrained(model_name)
-        self.model = T5ForConditionalGeneration.from_pretrained(model_name).to(DEVICE).eval()
+    def __init__(self, model_name, local_path):
+        # Try local path first, fallback to HF hub
+        model_path = local_path if os.path.exists(local_path) else model_name
+        print(f"Loading MonoT5 from {model_path}...")
+        self.tokenizer = T5Tokenizer.from_pretrained(model_path)
+        self.model = T5ForConditionalGeneration.from_pretrained(model_path).to(DEVICE).eval()
         if DEVICE=="cuda": self.model.half()
         if NUM_GPUS > 1: self.model = nn.DataParallel(self.model)
         self.true_tok = self.tokenizer.encode("true")[0]
@@ -130,7 +158,7 @@ class MonoT5Scorer:
                 # T5 decoder start
                 dec_in = torch.full((len(batch), 1), self.model.module.config.decoder_start_token_id if hasattr(self.model, "module") else self.model.config.decoder_start_token_id, device=DEVICE)
                 
-                out = self.model(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, decoder_input_ids=dec_in)
+                out = self.model(input_ids=inputs.input_ids, attention_mask=inputs.attention_mask, decoder_input_ids=dec_in, use_cache=False)
                 logits = out.logits[:, 0, :]
                 true_log = logits[:, self.true_tok]
                 false_log = logits[:, self.false_tok]
@@ -139,10 +167,12 @@ class MonoT5Scorer:
         return np.concatenate(all_scores)
 
 class QwenRanker:
-    def __init__(self, model_name):
-        print(f"Loading {model_name}...")
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    def __init__(self, model_name, local_path):
+        # Try local path first, fallback to HF hub
+        model_path = local_path if os.path.exists(local_path) else model_name
+        print(f"Loading Qwen from {model_path}...")
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
 
     def rerank(self, query, docs_list):
@@ -173,10 +203,20 @@ Ranking:"""
         
         msgs = [{"role": "system", "content": "You are a Ranker."}, {"role": "user", "content": prompt}]
         text_in = self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-        inputs = self.tokenizer([text_in], return_tensors="pt").to(self.model.device)
+        inputs = self.tokenizer([text_in], return_tensors="pt", padding=True).to(self.model.device)
+        
+        # Set attention mask explicitly to avoid warning
+        if inputs.attention_mask is None:
+            inputs['attention_mask'] = torch.ones_like(inputs.input_ids)
         
         with torch.no_grad():
-            gen_ids = self.model.generate(inputs.input_ids, max_new_tokens=128, temperature=0.01, do_sample=False)
+            gen_ids = self.model.generate(
+                inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                max_new_tokens=128,
+                do_sample=False,
+                pad_token_id=self.tokenizer.pad_token_id
+            )
         
         resp = self.tokenizer.batch_decode(gen_ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
         
@@ -206,13 +246,17 @@ Ranking:"""
 # 3. UTILS
 # ==========================================
 def load_env(path="env.json"):
-    if not os.path.exists(path): path = "/content/env.json"
+    if not os.path.exists(path): path = "../env.json"
     with open(path) as f: return json.load(f)
 
 def pandas_rrf(runs, k=60):
+    """
+    Performs RRF and returns a DataFrame with 'rank' column suitable for write_results.
+    """
     parts = []
     for r in runs:
-        r = r.sort_values(["qid", "score"], ascending=[False, False]) # Sort desc score
+        r = r.sort_values(["qid", "score"], ascending=[True, False]) # Sort by QID, then Score Desc
+        # Recalculate rank just in case
         r["rank"] = r.groupby("qid").cumcount() + 1
         r["rrf"] = 1.0 / (k + r["rank"])
         parts.append(r[["qid", "docno", "rrf"]])
@@ -220,6 +264,13 @@ def pandas_rrf(runs, k=60):
     combined = pd.concat(parts)
     fused = combined.groupby(["qid", "docno"], as_index=False)["rrf"].sum()
     fused = fused.rename(columns={"rrf": "score"})
+    
+    # CRITICAL FIX: Add Rank, Q0, System columns for TREC format
+    fused = fused.sort_values(["qid", "score"], ascending=[True, False])
+    fused["rank"] = fused.groupby("qid").cumcount() + 1
+    fused["Q0"] = "Q0"
+    fused["system"] = "RRF_fusion"
+    
     return fused
 
 # ==========================================
@@ -234,13 +285,13 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     os.makedirs(eval_dir, exist_ok=True)
     
-    print(f"{'='*60}\nSTARTING ISOLATED TEST PIPELINE\n{'='*60}")
+    print(f"{'='*60}\nSTARTING ISOLATED TEST PIPELINE (RESUMABLE)\n{'='*60}")
     
     # 1. Load Data
     print("Loading Index & Test Data...")
     index = pt.IndexFactory.of(env['paths']['index_path'])
     
-    q_path = env['paths']['query_variations']['mistral']['test']
+    q_path = "./rewritten-queries/mistral_test_rewritten_queries.jsonl"
     print(f"Queries (Mistral): {q_path}")
     queries = pd.read_json(q_path, lines=True)
     if 'text' in queries.columns: queries = queries.rename(columns={'text': 'query'})
@@ -253,119 +304,178 @@ def main():
     # STAGE 1: SPARSE (BM25)
     # ---------------------------------------------------------
     print("\n>>> STAGE 1: BM25 (Sparse)")
-    bm25 = pt.BatchRetrieve(index, wmodel="BM25", controls=BM25_PARAMS)
-    sparse_run = bm25.transform(queries_tok)
+    stage1_file = os.path.join(run_dir, "test_stage1_bm25.run")
     
-    # Save
-    pt.io.write_results(sparse_run, os.path.join(run_dir, "test_stage1_bm25.run"))
-    print(f"  Retrieved {len(sparse_run)} docs.")
+    if os.path.exists(stage1_file):
+        print(f"  [CHECKPOINT] Found existing run: {stage1_file}")
+        sparse_run = pt.io.read_results(stage1_file)
+    else:
+        # Updated API Call: Use pt.terrier.Retriever instead of BatchRetrieve
+        bm25 = pt.terrier.Retriever(index, wmodel="BM25", controls=BM25_PARAMS, verbose=True)
+        sparse_run = bm25.transform(queries_tok)
+        pt.io.write_results(sparse_run, stage1_file)
+        print(f"  Retrieved {len(sparse_run)} docs.")
 
     # ---------------------------------------------------------
     # STAGE 2: DENSE (Ensemble)
     # ---------------------------------------------------------
     print("\n>>> STAGE 2: Dense Retrieval (Fusion)")
+    stage2_file = os.path.join(run_dir, "test_stage2_dense_fusion.run")
     
-    # Filter Sparse to Top-1000 for input
-    sparse_run = sparse_run.sort_values(["qid", "score"], ascending=[True, False])
-    sparse_run["rank"] = sparse_run.groupby("qid").cumcount() + 1
-    candidates_dense = sparse_run[sparse_run["rank"] <= K_DENSE_INPUT].copy()
-    
-    # Fetch Text Once
-    text_pipe = pt.text.get_text(index, "text")
-    candidates_text = text_pipe.transform(candidates_dense)
-    
-    dense_results = []
-    
-    for name, cfg in DENSE_MODELS.items():
-        print(f"  Running {name}...")
-        scorer = DenseScorer(cfg)
-        scores = scorer.score(candidates_text["query"].tolist(), candidates_text["text"].tolist())
+    # Optimization: If fusion exists, we can skip everything
+    if os.path.exists(stage2_file):
+        print(f"  [CHECKPOINT] Found existing Fusion run: {stage2_file}")
+        dense_fused = pt.io.read_results(stage2_file)
+    else:
+        # Filter Sparse to Top-1000 for input
+        sparse_run = sparse_run.sort_values(["qid", "score"], ascending=[True, False])
+        sparse_run["rank"] = sparse_run.groupby("qid").cumcount() + 1
+        candidates_dense = sparse_run[sparse_run["rank"] <= K_DENSE_INPUT].copy()
         
-        df = candidates_text.copy()
-        df["score"] = scores
-        df["system"] = name
-        dense_results.append(df)
+        # Fetch Text Once
+        text_pipe = pt.text.get_text(index, "text")
+        candidates_text = text_pipe.transform(candidates_dense)
         
-        # Clear VRAM
-        del scorer
-        torch.cuda.empty_cache()
-    
-    # RRF Fusion
-    print("  Fusing Dense Runs...")
-    dense_fused = pandas_rrf(dense_results, k=60)
-    pt.io.write_results(dense_fused, os.path.join(run_dir, "test_stage2_dense_fusion.run"))
+        dense_results = []
+        
+        # Iterate through models with checkpointing for each
+        for name, cfg in DENSE_MODELS.items():
+            model_run_file = os.path.join(run_dir, f"test_stage2_{name}.run")
+            
+            if os.path.exists(model_run_file):
+                print(f"  [CHECKPOINT] Found existing run for {name}")
+                df = pt.io.read_results(model_run_file)
+            else:
+                print(f"  Running {name}...")
+                scorer = DenseScorer(cfg)
+                scores = scorer.score(candidates_text["query"].tolist(), candidates_text["text"].tolist())
+                
+                df = candidates_text.copy()
+                df["score"] = scores
+                df["system"] = name
+                df = df.sort_values(["qid", "score"], ascending=[True, False])
+                df["rank"] = df.groupby("qid").cumcount() + 1
+                df["Q0"] = "Q0"
+                
+                # Save intermediate model run
+                pt.io.write_results(df, model_run_file)
+                
+                # Clear VRAM
+                del scorer
+                torch.cuda.empty_cache()
+            
+            dense_results.append(df)
+        
+        # RRF Fusion
+        print("  Fusing Dense Runs...")
+        dense_fused = pandas_rrf(dense_results, k=60)
+        pt.io.write_results(dense_fused, stage2_file)
 
     # ---------------------------------------------------------
     # STAGE 3: CROSS-ENCODER (Hybrid Pool)
     # ---------------------------------------------------------
     print("\n>>> STAGE 3: Cross-Encoder (Hybrid Pool)")
+    stage3_file = os.path.join(run_dir, "test_stage3_ce.run")
     
-    # Pool Construction: Union of Top-100 BM25 + Top-100 Dense
-    # 1. BM25 Top 100
-    bm25_top = sparse_run[sparse_run["rank"] <= K_CE_POOL_SPARSE][['qid', 'docno']]
-    
-    # 2. Dense Top 100
-    dense_fused = dense_fused.sort_values(["qid", "score"], ascending=[True, False])
-    dense_fused["rank"] = dense_fused.groupby("qid").cumcount() + 1
-    dense_top = dense_fused[dense_fused["rank"] <= K_CE_POOL_DENSE][['qid', 'docno']]
-    
-    # 3. Union
-    pool = pd.concat([bm25_top, dense_top]).drop_duplicates(subset=['qid', 'docno'])
-    print(f"  Hybrid Pool Size: {len(pool)} (Approx {len(pool)/len(queries):.1f} per query)")
-    
-    # Fetch Text for Pool
-    # We need query text too
-    pool = pool.merge(queries[['qid', 'query']], on='qid')
-    pool = text_pipe.transform(pool)
-    
-    # Prepare text for MonoT5
-    # "Query: ... Document: ... Relevant:"
-    pairs = [f"Query: {r.query} Document: {r.text} Relevant:" for r in pool.itertuples()]
-    
-    # Score
-    ce_scorer = MonoT5Scorer(CE_MODEL)
-    ce_scores = ce_scorer.score(pairs)
-    del ce_scorer
-    torch.cuda.empty_cache()
-    
-    pool["score"] = ce_scores
-    pt.io.write_results(pool, os.path.join(run_dir, "test_stage3_ce.run"))
+    if os.path.exists(stage3_file):
+        print(f"  [CHECKPOINT] Found existing CE run: {stage3_file}")
+        pool = pt.io.read_results(stage3_file)
+        
+        # We need query/text columns for next stage if they aren't in standard run file
+        # Standard run file usually drops 'text' and 'query'. We need to re-fetch if loaded from disk.
+        # But wait, next stage needs text. Let's re-fetch text to be safe.
+        pool = pool.merge(queries[['qid', 'query']], on='qid')
+        text_pipe = pt.text.get_text(index, "text")
+        pool = text_pipe.transform(pool)
+    else:
+        # Pool Construction: Union of Top-100 BM25 + Top-100 Dense
+        # 1. BM25 Top 100
+        bm25_top = sparse_run[sparse_run["rank"] <= K_CE_POOL_SPARSE][['qid', 'docno']]
+        
+        # 2. Dense Top 100
+        dense_fused = dense_fused.sort_values(["qid", "score"], ascending=[True, False])
+        dense_fused["rank"] = dense_fused.groupby("qid").cumcount() + 1
+        dense_top = dense_fused[dense_fused["rank"] <= K_CE_POOL_DENSE][['qid', 'docno']]
+        
+        # 3. Union
+        pool = pd.concat([bm25_top, dense_top]).drop_duplicates(subset=['qid', 'docno'])
+        print(f"  Hybrid Pool Size: {len(pool)} (Approx {len(pool)/len(queries):.1f} per query)")
+        
+        # Fetch Text for Pool
+        pool = pool.merge(queries[['qid', 'query']], on='qid')
+        text_pipe = pt.text.get_text(index, "text")
+        pool = text_pipe.transform(pool)
+        
+        # Prepare text for MonoT5
+        pairs = [f"Query: {r.query} Document: {r.text} Relevant:" for r in pool.itertuples()]
+        
+        # Score
+        ce_scorer = MonoT5Scorer(CE_MODEL, CE_LOCAL_PATH)
+        ce_scores = ce_scorer.score(pairs)
+        del ce_scorer
+        torch.cuda.empty_cache()
+        
+        # FIX: Explicit reconstruction to ensure cleanliness and avoid KeyError
+        pool["score"] = ce_scores
+        pool = pool.sort_values(["qid", "score"], ascending=[True, False])
+        # Reset Index to prevent ambiguity
+        pool = pool.reset_index(drop=True)
+        pool["rank"] = pool.groupby("qid").cumcount() + 1
+        pool["Q0"] = "Q0"
+        pool["system"] = "monoT5"
+        
+        # Force select columns to verify they exist before passing to PyTerrier
+        final_pool_df = pool[["qid", "docno", "rank", "score", "Q0", "system"]]
+        
+        pt.io.write_results(final_pool_df, stage3_file)
 
     # ---------------------------------------------------------
     # STAGE 4: LLM RE-RANKING
     # ---------------------------------------------------------
     print("\n>>> STAGE 4: LLM Re-ranking (Qwen-72B)")
+    stage4_file = os.path.join(run_dir, "test_final_qwen.run")
     
-    # Filter CE results to Top-30 (Input for LLM)
-    pool = pool.sort_values(["qid", "score"], ascending=[True, False])
-    pool["rank"] = pool.groupby("qid").cumcount() + 1
-    
-    llm_candidates = pool[pool["rank"] <= K_LLM_INPUT].copy()
-    
-    # Initialize LLM
-    llm = QwenRanker(LLM_MODEL)
-    
-    final_rows = []
-    
-    grouped = llm_candidates.groupby("qid")
-    print(f"  Re-ranking Top-{K_LLM_INPUT}...")
-    
-    for qid, group in tqdm(grouped, total=len(grouped)):
-        q_text = group.iloc[0]['query']
-        docs = [(row.docno, row.text) for row in group.itertuples()]
+    if os.path.exists(stage4_file):
+        print(f"  [CHECKPOINT] Found existing LLM run: {stage4_file}")
+        final_run = pt.io.read_results(stage4_file)
+    else:
+        # Filter CE results to Top-30 (Input for LLM)
+        pool = pool.sort_values(["qid", "score"], ascending=[True, False])
+        pool["rank"] = pool.groupby("qid").cumcount() + 1
         
-        reranked = llm.rerank(q_text, docs)
+        llm_candidates = pool[pool["rank"] <= K_LLM_INPUT].copy()
         
-        for r in reranked:
-            final_rows.append({"qid": qid, "docno": r['docno'], "score": r['score']})
+        # Initialize LLM
+        llm = QwenRanker(LLM_MODEL, LLM_LOCAL_PATH)
+        
+        final_rows = []
+        
+        grouped = llm_candidates.groupby("qid")
+        print(f"  Re-ranking Top-{K_LLM_INPUT}...")
+        
+        for qid, group in tqdm(grouped, total=len(grouped)):
+            q_text = group.iloc[0]['query']
+            docs = [(row.docno, row.text) for row in group.itertuples()]
             
-    # Merge with Tail (CE ranks 31+)
-    # LLM scores are ~1000. CE scores are 0-1.
-    llm_df = pd.DataFrame(final_rows)
-    ce_tail = pool[pool["rank"] > K_LLM_INPUT][['qid', 'docno', 'score']]
-    
-    final_run = pd.concat([llm_df, ce_tail])
-    pt.io.write_results(final_run, os.path.join(run_dir, "test_final_qwen.run"))
+            reranked = llm.rerank(q_text, docs)
+            
+            for r in reranked:
+                final_rows.append({"qid": qid, "docno": r['docno'], "score": r['score']})
+                
+        # Merge with Tail (CE ranks 31+)
+        llm_df = pd.DataFrame(final_rows)
+        ce_tail = pool[pool["rank"] > K_LLM_INPUT][['qid', 'docno', 'score']]
+        
+        final_run = pd.concat([llm_df, ce_tail])
+        
+        # Final Format ensure
+        final_run = final_run.sort_values(["qid", "score"], ascending=[True, False])
+        final_run = final_run.reset_index(drop=True) # Checkpoint safety
+        final_run["rank"] = final_run.groupby("qid").cumcount() + 1
+        final_run["Q0"] = "Q0"
+        final_run["system"] = "Qwen_72B"
+        
+        pt.io.write_results(final_run, stage4_file)
     
     # ---------------------------------------------------------
     # EVALUATION

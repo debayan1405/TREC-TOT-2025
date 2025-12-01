@@ -19,15 +19,15 @@ MEASURES = [nDCG@10, nDCG@100, R@1000, P@10, RR, Success@10]
 
 def load_env(env_path="env.json"):
     if not os.path.exists(env_path):
-        # Fallback relative location
-        env_path = os.path.join(os.path.dirname(__file__), "env.json")
+        # Fallback: try parent directory (if script is in utilities/)
+        env_path = os.path.join(os.path.dirname(__file__), "..", "env.json")
     
     if not os.path.exists(env_path):
-        # Fallback to colab path if script is running there
-        env_path = "/content/env.json"
+        # Fallback: try current working directory
+        env_path = "env.json"
         
     if not os.path.exists(env_path):
-        print(f"Warning: env.json not found at {env_path}. Some dataset shortcuts might fail.")
+        print(f"Warning: env.json not found. Some dataset shortcuts might fail.")
         return {}
         
     with open(env_path, 'r') as f:
@@ -142,4 +142,4 @@ if __name__ == "__main__":
     main()
 
 
-# Running Command: python evaluate_run_file.py my_run_file.run --dataset test --save results.json
+# Running Command: python utilities/retrieval_metrics_check.py test_run_files/test_stage2_contriever.run --dataset test --save contriever_results.json
