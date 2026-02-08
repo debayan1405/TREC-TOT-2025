@@ -9,7 +9,7 @@ import numpy as np
 import re
 from torch.utils.data import DataLoader, Dataset
 import ir_measures
-from ir_measures import calc_aggregate, nDCG, R, P, RR, Success
+from ir_measures import Qrel, ScoredDoc, calc_aggregate, nDCG, AP, RR, Success, R, P
 from tqdm import tqdm
 import gc
 
@@ -66,11 +66,11 @@ K_CE_POOL_DENSE = 100  # Take top 100 from Dense Fusion
 
 # Stage 4: LLM
 LLM_MODEL = "Qwen/Qwen2.5-72B-Instruct-AWQ"
-LLM_LOCAL_PATH = os.path.join(LOCAL_MODEL_DIR, "qwen2.5-72b-awq")
+LLM_LOCAL_PATH = os.path.join(LOCAL_MODEL_DIR, "qwen", "qwen2.5-72b-awq")
 K_LLM_INPUT = 30 # Input to LLM
 LLM_CONTEXT_CHARS = 500 # Increased context window
 
-MEASURES = [nDCG@10, nDCG@100, R@1000, P@10, RR, Success@10]
+MEASURES = [nDCG@10, nDCG@100, R@1000, P@10, RR, Success@10, AP@10]
 
 # ==========================================
 # 2. HELPER CLASSES
@@ -291,11 +291,36 @@ def main():
     print("Loading Index & Test Data...")
     index = pt.IndexFactory.of(env['paths']['index_path'])
     
-    q_path = "./rewritten-queries/mistral_test_rewritten_queries.jsonl"
+    q_path = "./original-queries/test-2025-queries.jsonl"
     print(f"Queries (Mistral): {q_path}")
-    queries = pd.read_json(q_path, lines=True)
-    if 'text' in queries.columns: queries = queries.rename(columns={'text': 'query'})
-    if 'query_id' in queries.columns: queries = queries.rename(columns={'query_id': 'qid'})
+
+    # Robust JSONL loader: read line-by-line and handle common minor malformations
+    records = []
+    with open(q_path, 'r', encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            # Some lines contain a trailing comma after the JSON object — strip it
+            if line.endswith(','):
+                line = line[:-1]
+            # Fix a stray comma before the closing brace: '...,}' -> '...}'
+            line = re.sub(r',\s*}$', '}', line)
+            try:
+                obj = json.loads(line)
+                records.append(obj)
+            except Exception:
+                # Last-resort: remove non-JSON-friendly control chars and try again
+                cleaned = line.replace('\x00', '')
+                cleaned = re.sub(r'\s+$', '', cleaned)
+                obj = json.loads(cleaned)
+                records.append(obj)
+
+    queries = pd.DataFrame.from_records(records)
+    if 'text' in queries.columns:
+        queries = queries.rename(columns={'text': 'query'})
+    if 'query_id' in queries.columns:
+        queries = queries.rename(columns={'query_id': 'qid'})
     queries['qid'] = queries['qid'].astype(str)
     # Tokenize for Terrier
     queries_tok = pt.rewrite.tokenise()(queries)
@@ -304,7 +329,7 @@ def main():
     # STAGE 1: SPARSE (BM25)
     # ---------------------------------------------------------
     print("\n>>> STAGE 1: BM25 (Sparse)")
-    stage1_file = os.path.join(run_dir, "test_stage1_bm25.run")
+    stage1_file = os.path.join(run_dir, "test_stage1_bm25_original.run")
     
     if os.path.exists(stage1_file):
         print(f"  [CHECKPOINT] Found existing run: {stage1_file}")
@@ -320,7 +345,7 @@ def main():
     # STAGE 2: DENSE (Ensemble)
     # ---------------------------------------------------------
     print("\n>>> STAGE 2: Dense Retrieval (Fusion)")
-    stage2_file = os.path.join(run_dir, "test_stage2_dense_fusion.run")
+    stage2_file = os.path.join(run_dir, "test_stage2_dense_fusion_original.run")
     
     # Optimization: If fusion exists, we can skip everything
     if os.path.exists(stage2_file):
@@ -375,7 +400,7 @@ def main():
     # STAGE 3: CROSS-ENCODER (Hybrid Pool)
     # ---------------------------------------------------------
     print("\n>>> STAGE 3: Cross-Encoder (Hybrid Pool)")
-    stage3_file = os.path.join(run_dir, "test_stage3_ce.run")
+    stage3_file = os.path.join(run_dir, "test_stage3_ce_original.run")
     
     if os.path.exists(stage3_file):
         print(f"  [CHECKPOINT] Found existing CE run: {stage3_file}")
@@ -433,7 +458,7 @@ def main():
     # STAGE 4: LLM RE-RANKING
     # ---------------------------------------------------------
     print("\n>>> STAGE 4: LLM Re-ranking (Qwen-72B)")
-    stage4_file = os.path.join(run_dir, "test_final_qwen.run")
+    stage4_file = os.path.join(run_dir, "test_final_qwen_original.run")
     
     if os.path.exists(stage4_file):
         print(f"  [CHECKPOINT] Found existing LLM run: {stage4_file}")
