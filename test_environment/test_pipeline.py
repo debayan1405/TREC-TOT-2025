@@ -307,7 +307,7 @@ def main():
     print("Loading Index & Test Data...")
     index = pt.IndexFactory.of(env['paths']['index_path'])
 
-    q_path = "./original-queries/test-2025-queries.jsonl"
+    q_path = "./original-queries/trec-tot_Llama-3.3-70B-Instruct_hybrid_cot_test-2025-queries.jsonl"
     print(f"Queries (Mistral): {q_path}")
 
     # Robust JSONL loader: read line-by-line and handle common minor malformations
