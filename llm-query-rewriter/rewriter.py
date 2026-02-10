@@ -1,235 +1,180 @@
 # rewriter.py
 import json
 import os
-from typing import List, Dict
+import argparse
 import logging
-from tqdm import tqdm
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import sys
+from pathlib import Path
+from typing import List, Dict
 
-# Configure logger
-logging.basicConfig(level=logging.INFO)
+import torch
+from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# -----------------------
+# Hardcoded Configurations
+# -----------------------
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Hardcoded generation parameters
+GENERATION_CONFIG = {
+    "max_new_tokens": 128,
+    "temperature": 0.0,
+    "top_p": 0.95,
+    "do_sample": False
+}
 
-# -----------------------
-# Check existing output files
-# -----------------------
-def check_existing_output(model_name: str, dataset_version: str, output_dir: str) -> bool:
+# Logging settings
+PREVIEW_COUNT = 5
+
+# Prompts
+SYSTEM_PROMPT_RW = (
     """
-    Check if output file already exists for a model-dataset combination.
-    
-    Args:
-        model_name: Name of the model
-        dataset_version: Dataset version (train, dev-1, etc.)
-        output_dir: Output directory
-        
-    Returns:
-        bool: True if file exists and is non-empty, False otherwise
+    You are a query rewriter for a search engine. Your task is to rewrite a complex, verbose, tip-of-the-tongue description into a simple, keyword-focused search query.
+    Guidelines:
+    1. Identify the core entity type if implied (e.g., could be a movie, book, song, product, place, person, software tool, concept, etc. - the domain is open-ended). Perform cautious entity expansion by adding closely related aliases or canonical forms only if they are directly supported by the input text as well as by incorporating domain specific vocabulary (e.g., movies: "cinematography'', "anthology film''; books: "epistolary novel'', "bildungsroman''; science: "biochemical pathway'', "quantum phenomenon''; products: "form factor'', "backwards compatibility''). Never guess, invent, or infer entities that are not explicitly mentioned or unambiguously implied. If unsure, do not expand.
+
+    2. Extract key details in a domain-agnostic way: concrete attributes such as events, functions, features, relationships, names, dates, locations, behaviors, or other unique identifiers explicitly stated in the input (e.g., plot points for media, specifications for products, symptoms for medical queries, APIs for software, etc.). Do not add new facts.
+
+    3. Remove conversational filler ("I think it was...", "It might be...", "I remember seeing...").
+
+    4. Remove negative constraints or uncertainty unless crucial ("Not sure if...").
+
+    5. Strict grounding rule: Do NOT introduce any information, entities, attributes, or assumptions that are not present in the input query. Every token in the rewritten query must be traceable to the original text or to safe lexical transformations (e.g., synonyms). No external knowledge.
+
+    6. Formulate a concise query that a standard search engine (like Google or BM25) would understand. Output ONLY the rewritten query text. Do not output any explanations.
     """
-    outpath = os.path.join(output_dir, f"{model_name}_{dataset_version}_rewritten_queries.jsonl")
-    
-    if os.path.exists(outpath):
-        # Check if file is non-empty
-        try:
-            with open(outpath, 'r', encoding='utf-8') as f:
-                first_line = f.readline().strip()
-                if first_line:
-                    # Count total lines for verification
-                    f.seek(0)
-                    line_count = sum(1 for _ in f)
-                    logger.info(f"Found existing output: {outpath} with {line_count} lines")
-                    return True
-        except Exception as e:
-            logger.warning(f"Error reading existing file {outpath}: {e}")
-    
-    return False
+)
+USER_PROMPT_RW = "Original query: {QUERY}\nRewritten query:"
+
+SYSTEM_PROMPT_SUMMARIZE = (
+    """
+    You are a query summarizer for tip-of-the-tongue (TOT) information retrieval.
+    You will receive up to three different rewritten queries for the same original input.
+    Analyze each of the Queries given below and try to preserve the maximum, non-redundant information in the summarized version, which can be used as a substitute for the three separate queries without any information loss.
+    """
+)
 
 
 # -----------------------
-# Topic loader - Fixed field mapping
+# Utility Functions
 # -----------------------
-def load_topics(path: str) -> List[Dict]:
-    """Load topics from JSONL file, handling both q_id and query_id fields."""
-    topics = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError as e:
-                logger.error(
-                    f"Invalid JSON in topics file {path} at line {line_num}: {e}")
-                raise
-
-            # Handle both q_id and query_id field names
-            if "q_id" in obj:
-                query_id = obj["q_id"]
-            elif "query_id" in obj:
-                query_id = obj["query_id"]
-            else:
-                raise ValueError(
-                    f"Each topic must contain 'q_id' or 'query_id'. Missing in line {line_num}: {line}")
-
-            if "query" not in obj:
-                raise ValueError(
-                    f"Each topic must contain 'query'. Missing in line {line_num}: {line}")
-
-            # Standardize to query_id
-            topics.append({
-                "query_id": str(query_id),
-                "query": obj["query"]
-            })
-
-    logger.info(f"Loaded {len(topics)} topics from {path}")
-    return topics
-
-
-# -----------------------
-# Env validation - Fixed for new structure
-# -----------------------
-def validate_env(env: dict):
-    """Validate environment configuration structure."""
-    if "models" not in env:
-        raise ValueError("env.json must contain top-level 'models' key.")
-
-    if "paths" not in env:
-        raise ValueError("env.json must contain top-level 'paths' key.")
-
-    required_paths = [
-        "train_topics_path", "dev_1_topics_path", "dev_2_topics_path",
-        "dev_3_topics_path", "test_topics_path", "rewritten_queries_directory"
+def find_env_path():
+    """Find env.json file in current or parent directories."""
+    current_dir = Path(__file__).parent
+    checks = [
+        current_dir / "env.json",
+        current_dir.parent / "env.json",
+        current_dir.parent.parent / "env.json"
     ]
+    for path in checks:
+        if path.exists():
+            return str(path)
+    raise FileNotFoundError("env.json not found in hierarchy.")
 
+def validate_env(env: dict):
+    """Validate the cleaned environment structure."""
+    if "llm-models" not in env:
+        raise ValueError("env.json must contain 'llm-models'")
+    if "paths" not in env:
+        raise ValueError("env.json must contain 'paths'")
+    
+    required_paths = ["rewritten_queries_directory", "query_variations", "qrels"]
     for p in required_paths:
         if p not in env["paths"]:
             raise ValueError(f"env.json.paths must contain key '{p}'")
 
-    if "hf_token" not in env:
-        raise ValueError(
-            "env.json must contain top-level 'hf_token' (can be empty string).")
+    if "original" not in env["paths"]["query_variations"]:
+        raise ValueError("env.json.paths.query_variations must contain 'original'")
 
-    # Validate model configurations
-    for model_name, model_config in env["models"].items():
-        if "hf_id" not in model_config:
-            raise ValueError(f"Model '{model_name}' must have 'hf_id' key")
-        if "bitsandbytes" not in model_config:
-            raise ValueError(
-                f"Model '{model_name}' must have 'bitsandbytes' config")
+    logger.info("Environment configuration validated.")
 
-    logger.info("env.json validated successfully.")
+def load_jsonl(path: str) -> List[Dict]:
+    """Load JSONL file."""
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    data.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return data
+
+def save_jsonl(data: List[Dict], path: str):
+    """Save list of dicts to JSONL."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for item in data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 # -----------------------
-# Model loader with updated HuggingFace practices
+# Model Setup
 # -----------------------
-def setup_model(model_hf_id: str, bnb_conf: dict, hf_token: str = None):
+def setup_model(model_hf_id: str, hf_token: str = None):
     """
-    Setup model with optimized configuration for high-end hardware.
-
-    Args:
-        model_hf_id: HuggingFace model identifier
-        bnb_conf: BitsAndBytesConfig dictionary
-        hf_token: HuggingFace token for gated models
-
-    Returns:
-        tuple: (tokenizer, model)
+    Setup model without quantization (Full Precision/BFloat16).
     """
-    logger.info(f"Setting up model {model_hf_id} with optimized configuration for high-end hardware.")
-
+    logger.info(f"Loading model {model_hf_id} in bfloat16...")
     try:
-        # Setup tokenizer with proper token handling
         tokenizer = AutoTokenizer.from_pretrained(
             model_hf_id,
             use_fast=True,
-            token=hf_token if hf_token else None,
+            token=hf_token,
             trust_remote_code=True,
-            padding_side='left'  # Fix for decoder-only models
+            padding_side='left'
         )
-
-        # Ensure tokenizer has pad token
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        # Optimize for high-end hardware with 700+ GB RAM and 2x A6000 GPUs
-        # Use bfloat16 for better performance and disable quantization for faster inference
         model = AutoModelForCausalLM.from_pretrained(
             model_hf_id,
-            device_map="auto",  # Automatically distribute across 2 GPUs
+            device_map="auto",
             trust_remote_code=True,
-            token=hf_token if hf_token else None,
-            torch_dtype=torch.bfloat16,  # Use bfloat16 for better performance on A6000
-            low_cpu_mem_usage=True,
-            # No quantization for maximum speed with your hardware
+            token=hf_token,
+            torch_dtype=torch.bfloat16, # Max precision for A6000s
+            low_cpu_mem_usage=True
         )
-
-        # Ensure model is in eval mode
         model.eval()
         
-        # Enable model compilation for faster inference (if supported)
+        # Optional compile
         try:
             model = torch.compile(model, mode="reduce-overhead")
-            logger.info("Model compiled for optimized inference")
-        except Exception as e:
-            logger.warning(f"Model compilation failed, continuing without: {e}")
-
+        except:
+            pass
+            
+        return tokenizer, model
     except Exception as e:
-        logger.exception(f"Failed to load model {model_hf_id}. Exception: {e}")
+        logger.error(f"Failed to load model {model_hf_id}: {e}")
         raise
 
-    logger.info("Model loaded successfully with optimized configuration.")
-    return tokenizer, model
-
 
 # -----------------------
-# Prompt templates
+# Generation Logic
 # -----------------------
-SYSTEM_PROMPT_RW = (
-    "You are an expert in information retrieval query rewriting. \n"
-    "Your task is to take a verbose, artifact-rich query where the user "
-    "is trying to describe an item they cannot name, and rewrite it "
-    "into a clearer, concise, search-ready query.\n\n"
-    "Rules:\n"
-    "- Use ONLY information explicitly present in the input query.\n"
-    "- DO NOT add any facts, assumptions, or invented entities.\n"
-    "- DO NOT output commentary, confirmations, or step-by-step text.\n"
-    "- Output ONLY the rewritten query as a single paragraph of free text.\n"
-    "- Preserve as many identifying clues as possible, while keeping the output compact.\n"
-)
-
-USER_PROMPT_RW = "Original query: {QUERY}\nRewritten query:"
-
-
-# -----------------------
-# Batch processing for faster inference
-# -----------------------
-def rewrite_batch(tokenizer, model, queries: List[str], generation_conf: dict, batch_size: int = 8) -> List[str]:
-    """
-    Rewrite a batch of queries for faster processing.
-    
-    Args:
-        tokenizer: HuggingFace tokenizer
-        model: HuggingFace model
-        queries: List of original query texts
-        generation_conf: Generation configuration dictionary
-        batch_size: Number of queries to process in parallel
-        
-    Returns:
-        List[str]: List of rewritten queries
-    """
+def run_batch_generation(tokenizer, model, prompts: List[str], batch_size: int = 8) -> List[str]:
+    """Generic batch generation function."""
     results = []
     
-    for i in range(0, len(queries), batch_size):
-        batch_queries = queries[i:i+batch_size]
-        batch_prompts = [
-            f"{SYSTEM_PROMPT_RW}\n\n{USER_PROMPT_RW.format(QUERY=query)}"
-            for query in batch_queries
-        ]
-        
+    # Update config for generation call
+    gen_kwargs = {
+        "max_new_tokens": GENERATION_CONFIG["max_new_tokens"],
+        "do_sample": GENERATION_CONFIG["do_sample"],
+        "eos_token_id": tokenizer.eos_token_id,
+        "pad_token_id": tokenizer.pad_token_id,
+        "use_cache": True,
+    }
+    
+    # Only add sampling params if sampling is enabled
+    if GENERATION_CONFIG["do_sample"]:
+        gen_kwargs["temperature"] = GENERATION_CONFIG["temperature"]
+        gen_kwargs["top_p"] = GENERATION_CONFIG["top_p"]
+
+    for i in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[i:i+batch_size]
         try:
-            # Tokenize batch with proper padding
             inputs = tokenizer(
                 batch_prompts,
                 return_tensors="pt",
@@ -238,21 +183,6 @@ def rewrite_batch(tokenizer, model, queries: List[str], generation_conf: dict, b
                 max_length=2048
             ).to(model.device)
             
-            gen_kwargs = {
-                "max_new_tokens": generation_conf.get("max_new_tokens", 128),
-                "do_sample": generation_conf.get("do_sample", False),
-                "temperature": generation_conf.get("temperature", 0.0),
-                "top_p": generation_conf.get("top_p", 0.95),
-                "eos_token_id": tokenizer.eos_token_id,
-                "pad_token_id": tokenizer.pad_token_id,
-                "use_cache": True,
-            }
-            
-            # Add sampling parameters only if do_sample is True
-            if not gen_kwargs["do_sample"]:
-                gen_kwargs.pop("temperature")
-                gen_kwargs.pop("top_p")
-            
             with torch.no_grad():
                 outputs = model.generate(
                     input_ids=inputs["input_ids"],
@@ -260,182 +190,248 @@ def rewrite_batch(tokenizer, model, queries: List[str], generation_conf: dict, b
                     **gen_kwargs
                 )
             
-            # Decode batch results
-            batch_results = []
             for j, output in enumerate(outputs):
-                # Decode only the generated part
                 input_len = len(inputs["input_ids"][j])
                 generated_tokens = output[input_len:]
-                rewritten = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+                # Cleanup output
+                text = text.strip().split("\n")[0].strip()
+                results.append(text if text else "")
                 
-                # Clean up the output
-                rewritten = rewritten.strip()
-                if "\n" in rewritten:
-                    rewritten = rewritten.split("\n")[0].strip()
-                
-                batch_results.append(rewritten if rewritten else batch_queries[j])
-            
-            results.extend(batch_results)
-            
         except Exception as e:
-            logger.error(f"Error in batch processing: {e}")
-            # Fallback to original queries for this batch
-            results.extend(batch_queries)
-    
+            logger.error(f"Batch generation error: {e}")
+            results.extend([""] * len(batch_prompts))
+            
     return results
 
 
 # -----------------------
-# Single-query rewrite with better error handling
+# Task: Rewriting
 # -----------------------
-def rewrite_single(tokenizer, model, original_query: str, generation_conf: dict) -> str:
+def run_rewriting(env, models_to_run, datasets_to_run, hf_token):
     """
-    Rewrite a single query using the loaded model.
-
-    Args:
-        tokenizer: HuggingFace tokenizer
-        model: HuggingFace model
-        original_query: Original query text
-        generation_conf: Generation configuration dictionary
-
-    Returns:
-        str: Rewritten query
+    Execute rewriting task.
     """
-    try:
-        prompt = f"{SYSTEM_PROMPT_RW}\n\n{USER_PROMPT_RW.format(QUERY=original_query)}"
+    output_dir = env["paths"]["rewritten_queries_directory"]
+    
+    for model_name in models_to_run:
+        logger.info(f"=== Starting Rewriting with Model: {model_name} ===")
+        
+        model_cfg = env["llm-models"][model_name]
+        tokenizer, model = setup_model(model_cfg["hf_id"], hf_token)
 
-        # Tokenize with proper attention mask
-        inputs = tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048
-        ).to(model.device)
+        for dataset in datasets_to_run:
+            logger.info(f"Processing dataset: {dataset}")
+            
+            # Check Output Existence
+            output_filename = f"{model_name}_{dataset}_rewritten_queries.jsonl"
+            outpath = os.path.join(output_dir, output_filename)
+            
+            if os.path.exists(outpath) and os.path.getsize(outpath) > 0:
+                logger.info(f"Output already exists for {model_name}/{dataset}. Skipping.")
+                continue
 
-        gen_kwargs = {
-            "max_new_tokens": generation_conf.get("max_new_tokens", 128),
-            "do_sample": generation_conf.get("do_sample", False),
-            "temperature": generation_conf.get("temperature", 0.0),
-            "top_p": generation_conf.get("top_p", 0.95),
-            "eos_token_id": tokenizer.eos_token_id,
-            "pad_token_id": tokenizer.pad_token_id,
-            "use_cache": True,
-        }
+            # Load Topics
+            topic_path = env["paths"]["query_variations"]["original"].get(dataset)
+            if not topic_path:
+                logger.error(f"No original path found for dataset {dataset}")
+                continue
+                
+            topics = load_jsonl(topic_path)
+            # Normalize ID field
+            for t in topics:
+                if "q_id" in t: t["query_id"] = str(t.pop("q_id"))
+                if "query_id" in t: t["query_id"] = str(t["query_id"])
 
-        # Add sampling parameters only if do_sample is True
-        if not gen_kwargs["do_sample"]:
-            gen_kwargs.pop("temperature")
-            gen_kwargs.pop("top_p")
+            # Prepare Prompts
+            prompts = [
+                f"{SYSTEM_PROMPT_RW}\n\n{USER_PROMPT_RW.format(QUERY=t['query'])}" 
+                for t in topics
+            ]
+            
+            # Run Inference
+            rewrites = []
+            logger.info(f"Rewriting {len(prompts)} queries...")
+            for i in tqdm(range(0, len(prompts), 16), desc=f"{model_name}-{dataset}"):
+                batch_p = prompts[i:i+16]
+                batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=16)
+                rewrites.extend(batch_r)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                **gen_kwargs
-            )
+            # Save Results
+            results = []
+            for t, rw in zip(topics, rewrites):
+                results.append({
+                    "query_id": t["query_id"],
+                    "query": rw if rw else t["query"] # Fallback to original if empty
+                })
+            
+            save_jsonl(results, outpath)
+            logger.info(f"Saved to {outpath}")
+            
+            # Preview
+            print(f"\nPreview ({model_name} - {dataset}):")
+            for r in results[:PREVIEW_COUNT]:
+                print(f"ID: {r['query_id']} | RW: {r['query']}")
 
-        # Decode only the generated part
-        generated_tokens = outputs[0][len(inputs["input_ids"][0]):]
-        rewritten = tokenizer.decode(
-            generated_tokens, skip_special_tokens=True)
-
-        # Clean up the output
-        rewritten = rewritten.strip()
-        if "\n" in rewritten:
-            rewritten = rewritten.split("\n")[0].strip()
-
-        return rewritten
-
-    except Exception as e:
-        logger.error(f"Error in rewrite_single: {e}")
-        return ""
+        # Cleanup model to free VRAM for next model
+        del model, tokenizer
+        torch.cuda.empty_cache()
 
 
 # -----------------------
-# Batch rewrite loop with dynamic naming
+# Task: Summarization
 # -----------------------
-def rewrite_topic_set(model_name: str, model_hf_id: str, bnb_conf: dict,
-                      topic_file: str, output_dir: str, generation_conf: dict,
-                      dataset_version: str, preview_count: int = 5,
-                      hf_token: str = None, batch_size: int = 8):
+def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
     """
-    Rewrite all topics in a topic set using dynamic file naming with batch processing.
-
-    Args:
-        model_name: Name of the model (for file naming)
-        model_hf_id: HuggingFace model ID
-        bnb_conf: BitsAndBytes configuration
-        topic_file: Path to input topic file
-        output_dir: Output directory
-        generation_conf: Generation configuration
-        dataset_version: Dataset version (train, dev-1, etc.)
-        preview_count: Number of examples to preview
-        hf_token: HuggingFace token
-        batch_size: Number of queries to process in parallel
-
-    Returns:
-        list: List of rewritten topics
+    Execute summarization task.
     """
-    # Check if output already exists
-    if check_existing_output(model_name, dataset_version, output_dir):
-        logger.info(f"Output file already exists for {model_name} on {dataset_version}. Skipping...")
-        return []
+    rewritten_dir = Path(env["paths"]["rewritten_queries_directory"])
+    if summarizer_model_key not in env["llm-models"]:
+        raise ValueError(f"Summarizer model '{summarizer_model_key}' not found in env.json models.")
+
+    model_hf_id = env["llm-models"][summarizer_model_key]["hf_id"]
+    tokenizer, model = setup_model(model_hf_id, hf_token)
     
-    logger.info(f"Starting rewrite for {model_name} on {dataset_version}")
-    
-    tokenizer, model = setup_model(
-        model_hf_id=model_hf_id,
-        bnb_conf=bnb_conf,
-        hf_token=hf_token
-    )
+    logger.info(f"=== Starting Summarization using {summarizer_model_key} ===")
 
-    topics = load_topics(topic_file)
-    logger.info(
-        f"Beginning batch rewrite for {len(topics)} topics using model {model_name} "
-        f"on dataset {dataset_version} with batch size {batch_size}"
-    )
+    for dataset in datasets_to_run:
+        # Check Output Existence
+        # Output format: {dataset}_summarized_{model_name}.jsonl
+        output_filename = f"{dataset}_summarized_{summarizer_model_key}.jsonl"
+        output_path = rewritten_dir / output_filename
+        
+        if output_path.exists() and output_path.stat().st_size > 0:
+            logger.info(f"Summary file exists for {dataset}. Skipping.")
+            continue
 
-    # Extract queries for batch processing
-    queries = [t["query"] for t in topics]
-    query_ids = [t["query_id"] for t in topics]
-    
-    # Process in batches with progress bar
-    rewritten_queries = []
-    for i in tqdm(range(0, len(queries), batch_size), desc=f"Batch rewriting with {model_name}"):
-        batch_queries = queries[i:i+batch_size]
-        batch_results = rewrite_batch(tokenizer, model, batch_queries, generation_conf, len(batch_queries))
-        rewritten_queries.extend(batch_results)
-    
-    # Combine results
-    results = []
-    for qid, rewritten in zip(query_ids, rewritten_queries):
-        results.append({"query_id": qid, "query": rewritten})
+        # Regex/Glob approach to find input files
+        # Looking for {model}_{dataset}_rewritten_queries.jsonl
+        # Exclude existing summary files to avoid recursion
+        pattern = f"*_{dataset}_rewritten_queries.jsonl"
+        found_files = list(rewritten_dir.glob(pattern))
+        
+        if not found_files:
+            logger.warning(f"No rewritten files found for dataset '{dataset}' matching pattern '{pattern}'")
+            continue
+            
+        logger.info(f"Found {len(found_files)} source files for {dataset}: {[f.name for f in found_files]}")
+        
+        # Load and Group Queries
+        grouped_queries = {} # query_id -> [list of rewrites]
+        
+        for fpath in found_files:
+            data = load_jsonl(str(fpath))
+            for item in data:
+                qid = str(item["query_id"])
+                if qid not in grouped_queries:
+                    grouped_queries[qid] = []
+                grouped_queries[qid].append(item["query"])
 
-    # Dynamic file naming: model_name_dataset_version_rewritten_queries.jsonl
-    os.makedirs(output_dir, exist_ok=True)
-    outpath = os.path.join(
-        output_dir, f"{model_name}_{dataset_version}_rewritten_queries.jsonl")
+        # Prepare Prompts
+        query_ids = list(grouped_queries.keys())
+        prompts = []
+        
+        for qid in query_ids:
+            variants = grouped_queries[qid]
+            # Pad or trim to exactly 3 for prompt consistency if needed, 
+            # though prompt handles "up to three".
+            # Just listing them:
+            prompt_text = SYSTEM_PROMPT_SUMMARIZE
+            for idx, v in enumerate(variants[:3]):
+                prompt_text += f"Query {idx+1}: {v}\n"
+            prompt_text += "\nSummarized Query:"
+            prompts.append(prompt_text)
 
-    with open(outpath, "w", encoding="utf-8") as w:
-        for r in results:
-            w.write(json.dumps(r, ensure_ascii=False) + "\n")
+        # Run Inference
+        logger.info(f"Summarizing {len(prompts)} query sets...")
+        summaries = []
+        for i in tqdm(range(0, len(prompts), 16), desc=f"Summ-{dataset}"):
+            batch_p = prompts[i:i+16]
+            batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=16)
+            summaries.extend(batch_r)
 
-    logger.info(f"Wrote {len(results)} rewrites to {outpath}")
+        # Save Results
+        results = []
+        for qid, summ, original_variants in zip(query_ids, summaries, grouped_queries.values()):
+            final_query = summ if summ else original_variants[0] # Fallback
+            results.append({
+                "query_id": qid,
+                "query": final_query
+            })
 
-    # Preview results
-    logger.info(
-        f"Preview of first {preview_count} rewrites (original -> rewrite):")
-    for i, (orig, rew) in enumerate(zip(topics[:preview_count], results[:preview_count])):
-        print(f"\n--- Example {i+1} ---")
-        print("ORIGINAL:")
-        print(orig["query"])
-        print("\nREWRITTEN:")
-        print(rew["query"])
+        save_jsonl(results, str(output_path))
+        logger.info(f"Saved summaries to {output_path}")
 
-    # Clean up GPU memory
-    del model
-    del tokenizer
+        # Preview
+        print(f"\nPreview (Summary - {dataset}):")
+        for r in results[:PREVIEW_COUNT]:
+            print(f"ID: {r['query_id']} | Summ: {r['query']}")
+
+    del model, tokenizer
     torch.cuda.empty_cache()
 
-    return results
+
+# -----------------------
+# Main Entry Point
+# -----------------------
+def main():
+    parser = argparse.ArgumentParser(description="LLM Query Rewriter & Summarizer")
+    
+    # Task Selection
+    parser.add_argument("--task", choices=["rewrite", "summarize"], required=True, 
+                        help="Choose whether to rewrite original queries or summarize existing rewrites.")
+    
+    # Configuration
+    parser.add_argument("--env", default=None, help="Path to env.json")
+    
+    # Scope Selection
+    parser.add_argument("--datasets", nargs="*", 
+                        choices=["train", "dev-1", "dev-2", "dev-3", "test"],
+                        help="Specific datasets to process (default: all)")
+    
+    # Model Selection
+    parser.add_argument("--models", nargs="*", 
+                        help="For rewriting: specific models to run (default: all in env.json).")
+    
+    parser.add_argument("--summarizer", 
+                        help="For summarization: which model key from env.json to use as the summarizer.")
+
+    args = parser.parse_args()
+
+    # Load Env
+    env_path = args.env if args.env else find_env_path()
+    logger.info(f"Using environment: {env_path}")
+    with open(env_path) as f:
+        env = json.load(f)
+    validate_env(env)
+    
+    hf_token = env.get("hf_token") or None
+    
+    # Determine Datasets
+    available_datasets = list(env["paths"]["query_variations"]["original"].keys())
+    if args.datasets:
+        datasets_to_run = args.datasets
+    else:
+        datasets_to_run = available_datasets
+
+    # Execute Logic
+    if args.task == "rewrite":
+        # Determine Models
+        available_models = list(env["llm-models"].keys())
+        if args.models:
+            models_to_run = [m for m in args.models if m in available_models]
+            if len(models_to_run) != len(args.models):
+                logger.warning("Some requested models were not found in env.json")
+        else:
+            models_to_run = available_models
+            
+        run_rewriting(env, models_to_run, datasets_to_run, hf_token)
+
+    elif args.task == "summarize":
+        if not args.summarizer:
+            raise ValueError("--summarizer argument is required when task is 'summarize'")
+        
+        run_summarization(env, args.summarizer, datasets_to_run, hf_token)
+
+if __name__ == "__main__":
+    main()
