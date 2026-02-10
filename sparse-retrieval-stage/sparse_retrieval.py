@@ -26,7 +26,7 @@ if not pt.java.started():
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 # 1. Absolute Paths (Large external assets)
-INDEX_PATH = "trec-tot-2025/trec-tot-2025-pyterrier-index"
+INDEX_PATH = "/media/12TB/shared/datasets/indices/trec-tot-2025/trec-tot-2025-pyterrier-index"
 QRELS_ROOT = (SCRIPT_DIR / "../qrel").resolve()
 
 # 2. Relative Paths (Project structure)
