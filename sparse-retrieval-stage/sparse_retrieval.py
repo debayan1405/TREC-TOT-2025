@@ -2,25 +2,61 @@ import pyterrier as pt
 import pandas as pd
 import json
 import os
+import re
+import argparse
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import sys
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
-# Initialize PyTerrier with large heap for parallel processing
-import os
+# ==========================================
+# SYSTEM SETUP
+# ==========================================
+# Initialize PyTerrier with large heap
 os.environ["JAVA_OPTS"] = "-Xmx600g -Xms200g"
 if not pt.java.started():
     pt.java.init()
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & PATHS
 # ==========================================
-# The order of datasets to fine-tune on
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# 1. Absolute Paths (Large external assets)
+INDEX_PATH = "trec-tot-2025/trec-tot-2025-pyterrier-index"
+QRELS_ROOT = (SCRIPT_DIR / "../qrel").resolve()
+
+# 2. Relative Paths (Project structure)
+# Updated to direct outputs to sparse-retrieval-stage-1 subfolders
+PATHS = {
+    "rewritten_dir": (SCRIPT_DIR / "../rewritten-queries").resolve(),
+    "original_dir": (SCRIPT_DIR / "../original_queries").resolve(),
+    # Output paths updated as requested
+    "run_output_dir": (SCRIPT_DIR / "runs/sparse-retrieval-stage-1").resolve(),
+    "charts_dir": (SCRIPT_DIR / "evaluations/sparse-retrieval-stage-1/charts").resolve(),
+    "best_params_log": (SCRIPT_DIR / "evaluations/sparse-retrieval-stage-1/best_sparse_params.csv").resolve()
+}
+
+# 3. QREL Mappings
+QRELS_FILES = {
+    "train": os.path.join(QRELS_ROOT, "train-2025-qrel.txt"),
+    "dev1": os.path.join(QRELS_ROOT, "dev1-2025-qrel.txt"),
+    "dev2": os.path.join(QRELS_ROOT, "dev2-2025-qrel.txt"),
+    "dev3": os.path.join(QRELS_ROOT, "dev3-2025-qrel.txt"),
+    "test": os.path.join(QRELS_ROOT, "test-2025-qrel.txt")
+}
+
+# 4. Optimization Settings
+# Order of datasets to tune on sequentially
 DATASET_SEQUENCE = ["train", "dev1", "dev2"]
 
-# 1. Global Grid (Used for the first dataset to find rough area)
+# Metrics - UPDATED TO RECALL@1000
+TARGET_METRIC = "recall_1000"
+
+# Grid Search Configs
 GLOBAL_BM25_GRID = {
     "k1": [0.4, 0.8, 1.2, 1.6, 2.0, 2.5, 3.0, 3.5, 4.0],
     "b": [0.3, 0.4, 0.5, 0.6, 0.75, 0.8, 0.9, 1.0]
@@ -29,46 +65,90 @@ GLOBAL_PL2_GRID = {
     "c": [0.1, 0.5, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0]
 }
 
-# 2. Refinement Settings
 REFINE_STEPS = 5
 REFINE_RADIUS_K1 = 0.4
 REFINE_RADIUS_B = 0.2
 REFINE_RADIUS_C = 2.0
 
-# 3. System Resources
-# IMPORTANT: The current index uses compressed structures (BitFileBuffered) that are NOT thread-safe
-# Setting MAX_WORKERS > 1 causes "docid out of bounds" errors due to concurrent decompression
-# To enable parallelism, you would need to rebuild the index with different compression settings
-# or use uncompressed structures. For now, running sequentially to avoid corruption.
-MAX_WORKERS = 1
+MAX_WORKERS = 1  # Single thread to prevent index decompression errors
 
 # ==========================================
-# HELPERS
+# FILE PARSING LOGIC
 # ==========================================
-
-def load_env(env_path="env.json"):
-    with open(env_path, 'r') as f:
-        return json.load(f)
-
-def get_dataset_paths(env, dataset_key):
-    paths = env['paths']
-    key_map = {
-        "train": ("train_queries_path", "train_qrels_path"),
-        "dev1": ("dev_1_queries_path", "dev1_qrels_path"),
-        "dev2": ("dev_2_queries_path", "dev2_qrels_path"),
-        "dev3": ("dev_3_queries_path", "dev3_qrels_path"),
-        "test": ("test_queries_path", "test_qrels_path")
+def scan_query_variants():
+    """
+    Scans rewritten-queries and original-queries directories.
+    Returns a dictionary structured as:
+    {
+        "variant_name": {
+            "train": Path(...),
+            "dev1": Path(...),
+            ...
+        }
     }
-    q_key, qrel_key = key_map[dataset_key]
-    return paths[q_key], paths[qrel_key]
+    """
+    variants = {}
 
+    # 1. Scan Rewritten Directory
+    # Pattern A: Rewritten -> {model}_{dataset}_rewritten_queries.jsonl
+    # Pattern B: Summarized -> {dataset}_summarized_{model}.jsonl
+    if PATHS["rewritten_dir"].exists():
+        for f in PATHS["rewritten_dir"].glob("*.jsonl"):
+            name = f.name
+            
+            # Check Pattern A (Rewritten)
+            match_rw = re.match(r"^(?P<model>.*?)_(?P<dataset>.*?)_rewritten_queries\.jsonl$", name)
+            if match_rw:
+                model = match_rw.group("model")
+                dataset = match_rw.group("dataset")
+                variant_key = f"rewritten-{model}"
+                
+                if variant_key not in variants: variants[variant_key] = {}
+                variants[variant_key][dataset] = f
+                continue
+
+            # Check Pattern B (Summarized)
+            match_sum = re.match(r"^(?P<dataset>.*?)_summarized_(?P<model>.*?)\.jsonl$", name)
+            if match_sum:
+                model = match_sum.group("model")
+                dataset = match_sum.group("dataset")
+                variant_key = f"summarized-{model}"
+                
+                if variant_key not in variants: variants[variant_key] = {}
+                variants[variant_key][dataset] = f
+                continue
+
+    # 2. Scan Original Directory
+    # Pattern: {dataset}-original.jsonl
+    if PATHS["original_dir"].exists():
+        for f in PATHS["original_dir"].glob("*-original.jsonl"):
+            name = f.name
+            match_orig = re.match(r"^(?P<dataset>.*?)-original\.jsonl$", name)
+            if match_orig:
+                dataset = match_orig.group("dataset")
+                variant_key = "original"
+                if variant_key not in variants: variants[variant_key] = {}
+                variants[variant_key][dataset] = f
+
+    return variants
+
+# ==========================================
+# DATA LOADING
+# ==========================================
 def load_queries(query_path):
+    """Load queries from JSONL and format for PyTerrier."""
     queries_df = pd.read_json(query_path, lines=True)
+    
+    # Normalize columns
     if 'query_id' in queries_df.columns:
         queries_df = queries_df.rename(columns={'query_id': 'qid'})
     if 'text' in queries_df.columns:
         queries_df = queries_df.rename(columns={'text': 'query'})
+        
+    # Ensure string types
     queries_df['qid'] = queries_df['qid'].astype(str)
+    
+    # PyTerrier Tokenization
     queries_df = pt.rewrite.tokenise()(queries_df)
     return queries_df
 
@@ -80,30 +160,23 @@ def generate_refined_grid(center, radius, steps, min_val=0.01):
 
 def save_trec_run(model, topics, run_dir, filename):
     os.makedirs(run_dir, exist_ok=True)
-    output_path = os.path.join(run_dir, filename)
-    pt.io.write_results(model.transform(topics), output_path)
+    output_path = run_dir / filename
+    pt.io.write_results(model.transform(topics), str(output_path))
 
 def save_chart(fig, chart_dir, filename):
     os.makedirs(chart_dir, exist_ok=True)
-    output_path = os.path.join(chart_dir, filename)
-    fig.savefig(output_path)
+    output_path = chart_dir / filename
+    fig.savefig(str(output_path))
     plt.close(fig)
 
 # ==========================================
 # CORE EVALUATION LOGIC
 # ==========================================
-
 def evaluate_single_config(index, topics_dict, qrels, model_type, params, target_metric):
-    """
-    Runs a single configuration using a shared index object with threading.
-    topics_dict: Dictionary representation of topics for thread safety.
-    """
     try:
-        # Convert topics_dict back to DataFrame
         topics = pd.DataFrame(topics_dict)
         
         if model_type == "BM25":
-            # Using BatchRetrieve with the shared index object
             model = pt.terrier.Retriever(index, wmodel="BM25", 
                                    controls={"c": params['k1'], "bm25.b": params['b']}, 
                                    verbose=False)
@@ -112,26 +185,18 @@ def evaluate_single_config(index, topics_dict, qrels, model_type, params, target
                                    controls={"c": params['c']}, 
                                    verbose=False)
         
-        # 1. Retrieve
+        # Retrieve
         res = model.transform(topics)
         
-        # 2. Evaluate using ir_measures
+        # Evaluate using ir_measures
         import ir_measures
         from ir_measures import calc_aggregate
         
-        # Rename columns to match ir_measures expectations
-        qrels_formatted = qrels.rename(columns={
-            'qid': 'query_id',
-            'docno': 'doc_id', 
-            'label': 'relevance'
-        })
+        # Map DataFrame columns to ir_measures expectations
+        qrels_formatted = qrels.rename(columns={'qid': 'query_id', 'docno': 'doc_id', 'label': 'relevance'})
+        res_formatted = res.rename(columns={'qid': 'query_id', 'docno': 'doc_id'})
         
-        res_formatted = res.rename(columns={
-            'qid': 'query_id',
-            'docno': 'doc_id'
-        })
-        
-        # Convert metric name: ndcg_cut_10 -> nDCG@10
+        # Normalize Metric Name
         metric_map = {
             "ndcg_cut_10": "nDCG@10",
             "ndcg_cut_1000": "nDCG@1000", 
@@ -140,23 +205,19 @@ def evaluate_single_config(index, topics_dict, qrels, model_type, params, target
         }
         metric_name = metric_map.get(target_metric, target_metric)
         metric_obj = ir_measures.parse_measure(metric_name)
+        
         metrics_dict = calc_aggregate([metric_obj], qrels_formatted, res_formatted)
         score = metrics_dict[metric_obj]
         
         return {**params, "score": score}
         
     except Exception as e:
-        # Catch errors to prevent killing the whole pool, but print them
         print(f"Error evaluating {model_type} {params}: {e}")
         return {**params, "score": -1.0}
 
 def run_grid_search(index, topics, qrels, model_type, param_grid_list, target_metric, desc):
-    """
-    Executes the grid search in parallel using threading with a shared index.
-    Converts topics to dict to make it thread-safe.
-    """
     results = []
-    topics_dict = topics.to_dict('list')  # Convert to dict for thread safety
+    topics_dict = topics.to_dict('list')
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
@@ -165,63 +226,83 @@ def run_grid_search(index, topics, qrels, model_type, param_grid_list, target_me
         }
         
         for future in tqdm(as_completed(futures), total=len(futures), desc=desc, unit="cfg"):
-            result = future.result()
-            results.append(result)
+            results.append(future.result())
             
     return results
 
 # ==========================================
 # MAIN LOGIC
 # ==========================================
-
 def main():
-    env = load_env()
-    index_path = env['paths']['index_path']
-    
-    # Verify index exists before starting
-    if not os.path.exists(index_path):
-        print(f"Error: Index path not found: {index_path}")
+    parser = argparse.ArgumentParser(description="Sparse Retrieval Optimizer (BM25 & PL2)")
+    parser.add_argument("--variant", type=str, required=True, 
+                        help="Name of the query variant to optimize (e.g., 'rewritten-llama', 'original', 'summarized-mistral')")
+    args = parser.parse_args()
+
+    # 1. Setup Index
+    if not os.path.exists(INDEX_PATH):
+        print(f"Error: Index path not found: {INDEX_PATH}")
         return
 
-    # Load index once - will be shared across threads
-    print(f"Loading index from: {index_path}")
+    print(f"Loading index from: {INDEX_PATH}")
+    index = pt.IndexFactory.of(INDEX_PATH, properties={"index.meta.data-source": "fileinmem"})
+    print(f"Index loaded: {index.getCollectionStatistics().getNumberOfDocuments()} docs")
+
+    # 2. Select Query Variant
+    variants = scan_query_variants()
+    if not variants:
+        print("No query files found in ../rewritten-queries or ../original_queries")
+        return
+
+    selected_variant_name = args.variant
+    if selected_variant_name not in variants:
+        print(f"Error: Variant '{selected_variant_name}' not found.")
+        print("Available variants:")
+        for v in sorted(variants.keys()):
+            print(f" - {v}")
+        sys.exit(1)
+        
+    selected_variant_files = variants[selected_variant_name]
     
-    index = pt.IndexFactory.of(
-        index_path, 
-        properties={"index.meta.data-source": "fileinmem"}
-    )
+    # 3. Validation
+    missing_datasets = [ds for ds in DATASET_SEQUENCE if ds not in selected_variant_files]
+    if missing_datasets:
+        print(f"Warning: Selected variant '{selected_variant_name}' is missing files for: {missing_datasets}")
+        confirm = input("Continue anyway? (y/n): ")
+        if confirm.lower() != 'y':
+            return
+        # Filter sequence to only available datasets
+        active_sequence = [ds for ds in DATASET_SEQUENCE if ds in selected_variant_files]
+    else:
+        active_sequence = DATASET_SEQUENCE
 
-    print(f"Index loaded: {index.getCollectionStatistics().getNumberOfDocuments()} documents")
-
-    run_dir = env['paths']['sparse_run_directory']
-    eval_dir = env['paths']['evaluation_directory']
-    best_params_path = env['paths']['best_params_path']
-    chart_dir = os.path.join(eval_dir, "charts")
+    # 4. Optimization Loop
+    print(f"\nStarting Optimization for: {selected_variant_name}")
+    print(f"Metric: {TARGET_METRIC} (Recall@1000)")
+    print(f"Sequence: {active_sequence}")
     
-    metrics = env['eval_metrics']
-    target_metric = metrics[0]
-
     current_best_bm25 = {"k1": None, "b": None}
     current_best_pl2 = {"c": None}
-    
     history_log = []
 
-    print(f"Starting Sequential Optimization: {DATASET_SEQUENCE}")
-    print(f"Target Metric: {target_metric}")
-    print(f"Parallel Workers: {MAX_WORKERS}")
-
-    for dataset in DATASET_SEQUENCE:
+    for dataset in active_sequence:
         print(f"\n{'='*60}")
         print(f"PROCESSING DATASET: {dataset}")
         print(f"{'='*60}")
 
         # Load Data
-        q_path, qrel_path = get_dataset_paths(env, dataset)
-        topics = load_queries(q_path)
-        qrels = pt.io.read_qrels(qrel_path)
+        query_file = selected_variant_files[dataset]
+        qrel_file = QRELS_FILES.get(dataset)
+        
+        if not qrel_file or not os.path.exists(qrel_file):
+            print(f"Skipping {dataset}: QREL file not found at {qrel_file}")
+            continue
+
+        topics = load_queries(str(query_file))
+        qrels = pt.io.read_qrels(qrel_file)
 
         # -----------------------------------------------
-        # 1. Prepare Search Grids
+        # Prepare Grids
         # -----------------------------------------------
         bm25_configs = []
         pl2_configs = []
@@ -231,7 +312,6 @@ def main():
             for k1 in GLOBAL_BM25_GRID["k1"]:
                 for b in GLOBAL_BM25_GRID["b"]:
                     bm25_configs.append({"k1": k1, "b": b})
-            
             for c in GLOBAL_PL2_GRID["c"]:
                 pl2_configs.append({"c": c})
         else:
@@ -243,108 +323,102 @@ def main():
             for k1 in k1_vals:
                 for b in b_vals:
                     bm25_configs.append({"k1": k1, "b": b})
-            
             for c in c_vals:
                 pl2_configs.append({"c": c})
 
         # -----------------------------------------------
-        # 2. Optimize BM25
+        # Optimize BM25
         # -----------------------------------------------
         print(f"\n--- Optimizing BM25 ({len(bm25_configs)} configs) ---")
-        bm25_results = run_grid_search(index, topics, qrels, "BM25", bm25_configs, target_metric, f"BM25 Grid ({dataset})")
+        bm25_results = run_grid_search(index, topics, qrels, "BM25", bm25_configs, TARGET_METRIC, f"BM25 Grid")
         
         df_bm25 = pd.DataFrame(bm25_results)
-        # Handle cases where all might have failed
-        if df_bm25['score'].max() < 0:
-            print("CRITICAL ERROR: All BM25 runs failed. Check logs.")
-            return
+        if df_bm25.empty or df_bm25['score'].max() < 0:
+            print("CRITICAL ERROR: BM25 runs failed.")
+            continue
 
         best_bm25_row = df_bm25.loc[df_bm25['score'].idxmax()]
+        local_best_bm25 = {"k1": best_bm25_row['k1'], "b": best_bm25_row['b'], "score": best_bm25_row['score']}
         
-        local_best_bm25 = {
-            "k1": best_bm25_row['k1'],
-            "b": best_bm25_row['b'],
-            "score": best_bm25_row['score']
-        }
         print(f"Best BM25 on {dataset}: {local_best_bm25}")
-        
-        current_best_bm25["k1"] = local_best_bm25["k1"]
-        current_best_bm25["b"] = local_best_bm25["b"]
+        current_best_bm25.update({"k1": local_best_bm25["k1"], "b": local_best_bm25["b"]})
 
-        # Save Best Run
+        # Save Run
         best_bm25_model = pt.terrier.Retriever(index, wmodel="BM25", 
                                          controls={"c": local_best_bm25['k1'], "bm25.b": local_best_bm25['b']})
-        save_trec_run(best_bm25_model, topics, run_dir, 
-                      f"{dataset}_BEST_bm25_k1-{local_best_bm25['k1']:.2f}_b-{local_best_bm25['b']:.2f}.run")
+        run_filename = f"{dataset}_BEST_bm25_k1-{local_best_bm25['k1']:.2f}_b-{local_best_bm25['b']:.2f}_{selected_variant_name}.run"
+        save_trec_run(best_bm25_model, topics, PATHS["run_output_dir"], run_filename)
 
         # Plot Heatmap
         pivot = df_bm25.pivot(index="k1", columns="b", values="score")
         plt.figure(figsize=(10, 8))
         sns.heatmap(pivot, annot=True, cmap="viridis", fmt=".4f")
-        plt.title(f"BM25 Optimization ({dataset})\nRefined around previous best")
-        save_chart(plt.gcf(), chart_dir, f"{dataset}_bm25_optimization.png")
+        plt.title(f"BM25 Optimization ({dataset} - {selected_variant_name})\nMetric: {TARGET_METRIC}")
+        save_chart(plt.gcf(), PATHS["charts_dir"], f"{dataset}_bm25_{selected_variant_name}_{TARGET_METRIC}.png")
 
         # -----------------------------------------------
-        # 3. Optimize PL2
+        # Optimize PL2
         # -----------------------------------------------
         print(f"\n--- Optimizing PL2 ({len(pl2_configs)} configs) ---")
-        pl2_results = run_grid_search(index, topics, qrels, "PL2", pl2_configs, target_metric, f"PL2 Grid ({dataset})")
+        pl2_results = run_grid_search(index, topics, qrels, "PL2", pl2_configs, TARGET_METRIC, f"PL2 Grid")
         
         df_pl2 = pd.DataFrame(pl2_results)
-        if df_pl2['score'].max() < 0:
-            print("CRITICAL ERROR: All PL2 runs failed. Check logs.")
-            return
+        if df_pl2.empty or df_pl2['score'].max() < 0:
+            print("CRITICAL ERROR: PL2 runs failed.")
+            continue
 
         best_pl2_row = df_pl2.loc[df_pl2['score'].idxmax()]
+        local_best_pl2 = {"c": best_pl2_row['c'], "score": best_pl2_row['score']}
         
-        local_best_pl2 = {
-            "c": best_pl2_row['c'],
-            "score": best_pl2_row['score']
-        }
         print(f"Best PL2 on {dataset}: {local_best_pl2}")
-
         current_best_pl2["c"] = local_best_pl2["c"]
 
-        # Save Best Run
+        # Save Run
         best_pl2_model = pt.terrier.Retriever(index, wmodel="PL2", controls={"c": local_best_pl2['c']})
-        save_trec_run(best_pl2_model, topics, run_dir, 
-                      f"{dataset}_BEST_pl2_c-{local_best_pl2['c']:.2f}.run")
+        run_filename = f"{dataset}_BEST_pl2_c-{local_best_pl2['c']:.2f}_{selected_variant_name}.run"
+        save_trec_run(best_pl2_model, topics, PATHS["run_output_dir"], run_filename)
 
         # Plot Line
         plt.figure(figsize=(10, 6))
         df_pl2_sorted = df_pl2.sort_values(by="c")
         plt.plot(df_pl2_sorted['c'], df_pl2_sorted['score'], marker='o', linestyle='-')
-        plt.title(f"PL2 Optimization ({dataset})")
+        plt.title(f"PL2 Optimization ({dataset} - {selected_variant_name})\nMetric: {TARGET_METRIC}")
         plt.xlabel("Parameter c")
-        plt.ylabel(target_metric)
         plt.grid(True)
-        save_chart(plt.gcf(), chart_dir, f"{dataset}_pl2_optimization.png")
+        save_chart(plt.gcf(), PATHS["charts_dir"], f"{dataset}_pl2_{selected_variant_name}_{TARGET_METRIC}.png")
 
-        # -----------------------------------------------
-        # 4. Log History
-        # -----------------------------------------------
+        # Log History
         history_log.append({
+            "variant": selected_variant_name,
             "dataset": dataset,
             "model": "BM25",
             "k1": local_best_bm25['k1'],
             "b": local_best_bm25['b'],
             "param_c": None,
-            "metric": target_metric,
+            "metric": TARGET_METRIC,
             "value": local_best_bm25["score"]
         })
         history_log.append({
+            "variant": selected_variant_name,
             "dataset": dataset,
             "model": "PL2",
             "k1": None, 
             "b": None,
             "param_c": local_best_pl2['c'],
-            "metric": target_metric,
+            "metric": TARGET_METRIC,
             "value": local_best_pl2["score"]
         })
 
-    print(f"\nSaving optimization history to {best_params_path}")
-    pd.DataFrame(history_log).to_csv(best_params_path, index=False)
-    print("Optimization Complete.")
+    # Save History
+    if history_log:
+        os.makedirs(PATHS["best_params_log"].parent, exist_ok=True)
+        # Append to existing log if exists, else create new
+        mode = 'a' if PATHS["best_params_log"].exists() else 'w'
+        header = not PATHS["best_params_log"].exists()
+        pd.DataFrame(history_log).to_csv(PATHS["best_params_log"], mode=mode, header=header, index=False)
+        print(f"\nOptimization history updated at {PATHS['best_params_log']}")
+    else:
+        print("\nNo history to save.")
 
 if __name__ == "__main__":
     main()

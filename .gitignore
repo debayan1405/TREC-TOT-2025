@@ -173,10 +173,6 @@ indices/
 *.pkl
 *.pickle
 
-# Evaluation results
-results/
-output/
-runs/
 
 # Temporary files
 temp/
@@ -219,5 +215,3 @@ trec-tot-2025-pyterrier-index*
 rewritten_queries_backup/
 *corpus*
 *.gz*
-/utilities
-/trec-conference-formalities
