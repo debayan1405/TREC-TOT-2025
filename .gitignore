@@ -215,5 +215,5 @@ trec-tot-2025-pyterrier-index*
 rewritten_queries_backup/
 *corpus*
 *.gz*
-/trec-conference-formalities
-/utilities
+trec-conference-formalities/
+utilities/
