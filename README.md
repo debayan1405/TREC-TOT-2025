@@ -172,7 +172,7 @@ The pipeline utilizes `ir_measures` for evaluation. The primary metrics tracked 
 
 * **Framework:** [PyTerrier](https://github.com/terrier-org/pyterrier)
 * **Models:**
-* Bi-Encoders: [ColBERTv2](https://arxiv.org/abs/2112.01488), [Contriever](https://arxiv.org/pdf/2112.09118), [E5-Large](https://arxiv.org/abs/2212.03533)
-* Cross-Encoder: [MonoT5 (Castorini)](https://arxiv.org/abs/2003.06713)
-* LLMs: [Qwen-2.5-72B-Instruct](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct-AWQ), [Mistral-7B-Instruct-v0.3 ](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3), [Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
+  * Bi-Encoders: [ColBERTv2](https://arxiv.org/abs/2112.01488), [Contriever](https://arxiv.org/pdf/2112.09118), [E5-Large](https://arxiv.org/abs/2212.03533)
+  * Cross-Encoder: [MonoT5 (Castorini)](https://arxiv.org/abs/2003.06713)
+  * LLMs: [Qwen-2.5-72B-Instruct](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct-AWQ), [Mistral-7B-Instruct-v0.3 ](https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3), [Meta-Llama-3-8B-Instruct](https://huggingface.co/meta-llama/Meta-Llama-3-8B-Instruct), [Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct)
 
