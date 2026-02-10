@@ -12,12 +12,28 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # -----------------------
-# Hardcoded Configurations
+# Configuration & Constants
 # -----------------------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Hardcoded generation parameters
+# Base directory relative to this script
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Hardcoded Paths (Resolved relative to script location for safety)
+# using ../ notation as requested, but wrapping in resolve()
+PATHS = {
+    "rewritten_output_dir": (SCRIPT_DIR / "../rewritten-queries").resolve(),
+    "original_queries": {
+        "train": (SCRIPT_DIR / "../original_queries/train-original.jsonl").resolve(),
+        "dev1": (SCRIPT_DIR / "../original_queries/dev1-original.jsonl").resolve(),
+        "dev2": (SCRIPT_DIR / "../original_queries/dev2-original.jsonl").resolve(),
+        "dev3": (SCRIPT_DIR / "../original_queries/dev3-original.jsonl").resolve(),
+        "test": (SCRIPT_DIR / "../original_queries/test-original.jsonl").resolve()
+    }
+}
+
+# Generation Config
 GENERATION_CONFIG = {
     "max_new_tokens": 128,
     "temperature": 0.0,
@@ -25,10 +41,11 @@ GENERATION_CONFIG = {
     "do_sample": False
 }
 
-# Logging settings
 PREVIEW_COUNT = 5
 
+# -----------------------
 # Prompts
+# -----------------------
 SYSTEM_PROMPT_RW = (
     """
     You are a query rewriter for a search engine. Your task is to rewrite a complex, verbose, tip-of-the-tongue description into a simple, keyword-focused search query.
@@ -60,51 +77,34 @@ SYSTEM_PROMPT_SUMMARIZE = (
 # -----------------------
 # Utility Functions
 # -----------------------
-def find_env_path():
-    """Find env.json file in current or parent directories."""
-    current_dir = Path(__file__).parent
-    checks = [
-        current_dir / "env.json",
-        current_dir.parent / "env.json",
-        current_dir.parent.parent / "env.json"
-    ]
-    for path in checks:
-        if path.exists():
-            return str(path)
-    raise FileNotFoundError("env.json not found in hierarchy.")
-
-def validate_env(env: dict):
-    """Validate the cleaned environment structure."""
-    if "llm-models" not in env:
-        raise ValueError("env.json must contain 'llm-models'")
-    if "paths" not in env:
-        raise ValueError("env.json must contain 'paths'")
+def load_llm_config() -> Dict:
+    """Load LLM configurations from local JSON file."""
+    config_path = SCRIPT_DIR / "llm-config.json"
+    if not config_path.exists():
+        raise FileNotFoundError(f"llm-config.json not found at {config_path}")
     
-    required_paths = ["rewritten_queries_directory", "query_variations", "qrels"]
-    for p in required_paths:
-        if p not in env["paths"]:
-            raise ValueError(f"env.json.paths must contain key '{p}'")
+    with open(config_path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-    if "original" not in env["paths"]["query_variations"]:
-        raise ValueError("env.json.paths.query_variations must contain 'original'")
-
-    logger.info("Environment configuration validated.")
-
-def load_jsonl(path: str) -> List[Dict]:
-    """Load JSONL file."""
+def load_jsonl(path: Path) -> List[Dict]:
+    """Load JSONL file safely."""
     data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if line.strip():
-                try:
-                    data.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        data.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except FileNotFoundError:
+        logger.error(f"File not found: {path}")
+        return []
     return data
 
-def save_jsonl(data: List[Dict], path: str):
+def save_jsonl(data: List[Dict], path: Path):
     """Save list of dicts to JSONL."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(path.parent, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         for item in data:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -113,7 +113,7 @@ def save_jsonl(data: List[Dict], path: str):
 # -----------------------
 # Model Setup
 # -----------------------
-def setup_model(model_hf_id: str, hf_token: str = None):
+def setup_model(model_hf_id: str):
     """
     Setup model without quantization (Full Precision/BFloat16).
     """
@@ -122,7 +122,6 @@ def setup_model(model_hf_id: str, hf_token: str = None):
         tokenizer = AutoTokenizer.from_pretrained(
             model_hf_id,
             use_fast=True,
-            token=hf_token,
             trust_remote_code=True,
             padding_side='left'
         )
@@ -133,13 +132,12 @@ def setup_model(model_hf_id: str, hf_token: str = None):
             model_hf_id,
             device_map="auto",
             trust_remote_code=True,
-            token=hf_token,
             torch_dtype=torch.bfloat16, # Max precision for A6000s
             low_cpu_mem_usage=True
         )
         model.eval()
         
-        # Optional compile
+        # Optional compile for speedup
         try:
             model = torch.compile(model, mode="reduce-overhead")
         except:
@@ -158,7 +156,6 @@ def run_batch_generation(tokenizer, model, prompts: List[str], batch_size: int =
     """Generic batch generation function."""
     results = []
     
-    # Update config for generation call
     gen_kwargs = {
         "max_new_tokens": GENERATION_CONFIG["max_new_tokens"],
         "do_sample": GENERATION_CONFIG["do_sample"],
@@ -167,7 +164,6 @@ def run_batch_generation(tokenizer, model, prompts: List[str], batch_size: int =
         "use_cache": True,
     }
     
-    # Only add sampling params if sampling is enabled
     if GENERATION_CONFIG["do_sample"]:
         gen_kwargs["temperature"] = GENERATION_CONFIG["temperature"]
         gen_kwargs["top_p"] = GENERATION_CONFIG["top_p"]
@@ -194,7 +190,7 @@ def run_batch_generation(tokenizer, model, prompts: List[str], batch_size: int =
                 input_len = len(inputs["input_ids"][j])
                 generated_tokens = output[input_len:]
                 text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-                # Cleanup output
+                # Cleanup output: take first line, strip whitespace
                 text = text.strip().split("\n")[0].strip()
                 results.append(text if text else "")
                 
@@ -208,36 +204,38 @@ def run_batch_generation(tokenizer, model, prompts: List[str], batch_size: int =
 # -----------------------
 # Task: Rewriting
 # -----------------------
-def run_rewriting(env, models_to_run, datasets_to_run, hf_token):
-    """
-    Execute rewriting task.
-    """
-    output_dir = env["paths"]["rewritten_queries_directory"]
+def run_rewriting(llm_config, models_to_run, datasets_to_run, batch_size):
+    """Execute rewriting task."""
+    output_dir = PATHS["rewritten_output_dir"]
     
     for model_name in models_to_run:
         logger.info(f"=== Starting Rewriting with Model: {model_name} ===")
         
-        model_cfg = env["llm-models"][model_name]
-        tokenizer, model = setup_model(model_cfg["hf_id"], hf_token)
+        model_cfg = llm_config[model_name]
+        tokenizer, model = setup_model(model_cfg["hf_id"])
 
         for dataset in datasets_to_run:
             logger.info(f"Processing dataset: {dataset}")
             
             # Check Output Existence
             output_filename = f"{model_name}_{dataset}_rewritten_queries.jsonl"
-            outpath = os.path.join(output_dir, output_filename)
+            outpath = output_dir / output_filename
             
-            if os.path.exists(outpath) and os.path.getsize(outpath) > 0:
+            if outpath.exists() and outpath.stat().st_size > 0:
                 logger.info(f"Output already exists for {model_name}/{dataset}. Skipping.")
                 continue
 
             # Load Topics
-            topic_path = env["paths"]["query_variations"]["original"].get(dataset)
+            topic_path = PATHS["original_queries"].get(dataset)
             if not topic_path:
-                logger.error(f"No original path found for dataset {dataset}")
+                logger.error(f"No original path configured for dataset '{dataset}'")
                 continue
                 
             topics = load_jsonl(topic_path)
+            if not topics:
+                logger.warning(f"No topics loaded from {topic_path}")
+                continue
+
             # Normalize ID field
             for t in topics:
                 if "q_id" in t: t["query_id"] = str(t.pop("q_id"))
@@ -252,9 +250,9 @@ def run_rewriting(env, models_to_run, datasets_to_run, hf_token):
             # Run Inference
             rewrites = []
             logger.info(f"Rewriting {len(prompts)} queries...")
-            for i in tqdm(range(0, len(prompts), 16), desc=f"{model_name}-{dataset}"):
-                batch_p = prompts[i:i+16]
-                batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=16)
+            for i in tqdm(range(0, len(prompts), batch_size), desc=f"{model_name}-{dataset}"):
+                batch_p = prompts[i:i+batch_size]
+                batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=batch_size)
                 rewrites.extend(batch_r)
 
             # Save Results
@@ -281,22 +279,20 @@ def run_rewriting(env, models_to_run, datasets_to_run, hf_token):
 # -----------------------
 # Task: Summarization
 # -----------------------
-def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
-    """
-    Execute summarization task.
-    """
-    rewritten_dir = Path(env["paths"]["rewritten_queries_directory"])
-    if summarizer_model_key not in env["llm-models"]:
-        raise ValueError(f"Summarizer model '{summarizer_model_key}' not found in env.json models.")
+def run_summarization(llm_config, summarizer_model_key, datasets_to_run, batch_size):
+    """Execute summarization task."""
+    rewritten_dir = PATHS["rewritten_output_dir"]
+    
+    if summarizer_model_key not in llm_config:
+        raise ValueError(f"Summarizer model '{summarizer_model_key}' not found in llm-config.json")
 
-    model_hf_id = env["llm-models"][summarizer_model_key]["hf_id"]
-    tokenizer, model = setup_model(model_hf_id, hf_token)
+    model_hf_id = llm_config[summarizer_model_key]["hf_id"]
+    tokenizer, model = setup_model(model_hf_id)
     
     logger.info(f"=== Starting Summarization using {summarizer_model_key} ===")
 
     for dataset in datasets_to_run:
         # Check Output Existence
-        # Output format: {dataset}_summarized_{model_name}.jsonl
         output_filename = f"{dataset}_summarized_{summarizer_model_key}.jsonl"
         output_path = rewritten_dir / output_filename
         
@@ -305,22 +301,25 @@ def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
             continue
 
         # Regex/Glob approach to find input files
-        # Looking for {model}_{dataset}_rewritten_queries.jsonl
-        # Exclude existing summary files to avoid recursion
+        # Pattern: {model}_{dataset}_rewritten_queries.jsonl
+        # Must exclude existing summary files to avoid recursion
         pattern = f"*_{dataset}_rewritten_queries.jsonl"
         found_files = list(rewritten_dir.glob(pattern))
         
-        if not found_files:
-            logger.warning(f"No rewritten files found for dataset '{dataset}' matching pattern '{pattern}'")
+        # Filter out self-reference or other summary files just in case
+        source_files = [f for f in found_files if "summarized" not in f.name]
+        
+        if not source_files:
+            logger.warning(f"No rewritten source files found for dataset '{dataset}' matching '{pattern}'")
             continue
             
-        logger.info(f"Found {len(found_files)} source files for {dataset}: {[f.name for f in found_files]}")
+        logger.info(f"Found {len(source_files)} source files for {dataset}: {[f.name for f in source_files]}")
         
         # Load and Group Queries
         grouped_queries = {} # query_id -> [list of rewrites]
         
-        for fpath in found_files:
-            data = load_jsonl(str(fpath))
+        for fpath in source_files:
+            data = load_jsonl(fpath)
             for item in data:
                 qid = str(item["query_id"])
                 if qid not in grouped_queries:
@@ -333,10 +332,8 @@ def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
         
         for qid in query_ids:
             variants = grouped_queries[qid]
-            # Pad or trim to exactly 3 for prompt consistency if needed, 
-            # though prompt handles "up to three".
-            # Just listing them:
-            prompt_text = SYSTEM_PROMPT_SUMMARIZE
+            # Construct prompt with up to 3 variants
+            prompt_text = SYSTEM_PROMPT_SUMMARIZE + "\n\n"
             for idx, v in enumerate(variants[:3]):
                 prompt_text += f"Query {idx+1}: {v}\n"
             prompt_text += "\nSummarized Query:"
@@ -345,9 +342,9 @@ def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
         # Run Inference
         logger.info(f"Summarizing {len(prompts)} query sets...")
         summaries = []
-        for i in tqdm(range(0, len(prompts), 16), desc=f"Summ-{dataset}"):
-            batch_p = prompts[i:i+16]
-            batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=16)
+        for i in tqdm(range(0, len(prompts), batch_size), desc=f"Summ-{dataset}"):
+            batch_p = prompts[i:i+batch_size]
+            batch_r = run_batch_generation(tokenizer, model, batch_p, batch_size=batch_size)
             summaries.extend(batch_r)
 
         # Save Results
@@ -359,7 +356,7 @@ def run_summarization(env, summarizer_model_key, datasets_to_run, hf_token):
                 "query": final_query
             })
 
-        save_jsonl(results, str(output_path))
+        save_jsonl(results, output_path)
         logger.info(f"Saved summaries to {output_path}")
 
         # Preview
@@ -381,9 +378,6 @@ def main():
     parser.add_argument("--task", choices=["rewrite", "summarize"], required=True, 
                         help="Choose whether to rewrite original queries or summarize existing rewrites.")
     
-    # Configuration
-    parser.add_argument("--env", default=None, help="Path to env.json")
-    
     # Scope Selection
     parser.add_argument("--datasets", nargs="*", 
                         choices=["train", "dev-1", "dev-2", "dev-3", "test"],
@@ -391,47 +385,55 @@ def main():
     
     # Model Selection
     parser.add_argument("--models", nargs="*", 
-                        help="For rewriting: specific models to run (default: all in env.json).")
+                        help="For rewriting: specific models to run (default: all available).")
     
     parser.add_argument("--summarizer", 
-                        help="For summarization: which model key from env.json to use as the summarizer.")
+                        help="For summarization: which model key from llm-config.json to use.")
+
+    parser.add_argument("--batch-size", type=int, default=8,
+                        help="Batch size for generation (default: 8).")
 
     args = parser.parse_args()
 
-    # Load Env
-    env_path = args.env if args.env else find_env_path()
-    logger.info(f"Using environment: {env_path}")
-    with open(env_path) as f:
-        env = json.load(f)
-    validate_env(env)
+    # Load Config
+    llm_config = load_llm_config()
+    available_models = list(llm_config.keys())
+    logger.info(f"Loaded LLM configuration. Available models: {available_models}")
     
-    hf_token = env.get("hf_token") or None
+    # Map CLI dataset names to PATHS keys
+    dataset_map = {
+        "train": "train",
+        "dev-1": "dev1",
+        "dev-2": "dev2",
+        "dev-3": "dev3",
+        "test": "test"
+    }
     
-    # Determine Datasets
-    available_datasets = list(env["paths"]["query_variations"]["original"].keys())
     if args.datasets:
-        datasets_to_run = args.datasets
+        datasets_to_run = [dataset_map[d] for d in args.datasets if d in dataset_map]
     else:
-        datasets_to_run = available_datasets
+        datasets_to_run = list(dataset_map.values())
 
     # Execute Logic
     if args.task == "rewrite":
-        # Determine Models
-        available_models = list(env["llm-models"].keys())
         if args.models:
             models_to_run = [m for m in args.models if m in available_models]
-            if len(models_to_run) != len(args.models):
-                logger.warning("Some requested models were not found in env.json")
+            invalid_models = [m for m in args.models if m not in available_models]
+            if invalid_models:
+                logger.warning(f"Skipping invalid models requested: {invalid_models}")
+                logger.warning(f"Available models: {available_models}")
+            if not models_to_run:
+                raise ValueError("No valid models selected for rewriting.")
         else:
             models_to_run = available_models
             
-        run_rewriting(env, models_to_run, datasets_to_run, hf_token)
+        run_rewriting(llm_config, models_to_run, datasets_to_run, args.batch_size)
 
     elif args.task == "summarize":
         if not args.summarizer:
             raise ValueError("--summarizer argument is required when task is 'summarize'")
         
-        run_summarization(env, args.summarizer, datasets_to_run, hf_token)
+        run_summarization(llm_config, args.summarizer, datasets_to_run, args.batch_size)
 
 if __name__ == "__main__":
     main()
